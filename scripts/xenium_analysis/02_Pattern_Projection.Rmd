@@ -1,0 +1,574 @@
+---
+title: "02_Pattern_Projection"
+author: "Jacob Mitchell"
+date: "2023-04-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(sp, lib.loc = "~/FertigLab/Seurat_Xenium")
+library(SeuratObject, lib.loc = "~/FertigLab/Seurat_Xenium")
+library(Seurat, lib.loc = "~/FertigLab/Seurat_Xenium")
+library(ggplot2, lib.loc = "~/FertigLab/Seurat_Xenium")
+library(CoGAPS)
+library(projectR)
+library(colorRamps)
+
+set.seed(123)
+sessionInfo()
+```
+
+```{r}
+result_dir <- "processed_data/02_Pattern_Projection"
+if(!dir.exists(result_dir)){
+  dir.create(result_dir, recursive = T)
+}
+figure_dir <- "figures/02_Pattern_Projection"
+if(!dir.exists(figure_dir)){
+  dir.create(figure_dir, recursive = T)
+}
+```
+
+```{r}
+# Load the merged Seurat object of xenium data
+seurat <- readRDS("processed_data/01_Load_Xenium_Data/Xenium_combined_SCT_processed.rds")
+# rename images to segment names
+# fov = PanIN1131_A
+# fov.1 = PanIN1131_B
+# fov.2 = PanIN1142
+# fov.3 = PanIN1132
+# fov.4 = PanIN1144
+# renaming using Images(seurat) <- c(names) does not work, but new FOVs can be
+# created with Crop to specify names for new
+
+```
+
+```{r}
+# load CoGAPS results for projectR
+cogaps <- readRDS("data/PDAC_Atlas/CoGAPS_result/epiMat-e74511f6-8a1d-4929-ab42-1cb67c5a4fb6-result-8pattern.rds")
+
+# list features shared by CoGAPS result and Xenium data
+cogaps_features <- rownames(cogaps@featureLoadings)
+xenium_features <- rownames(seurat)
+shared_features <- cogaps_features[cogaps_features %in% xenium_features]
+length(shared_features)
+shared_features
+
+# attempt projection
+project_res <- projectR(seurat@assays$SCT@scale.data,
+                        loadings = cogaps@featureLoadings)
+project_cxg <- t(project_res)
+project_cxg <- project_cxg[rownames(seurat@meta.data),]
+seurat@meta.data <- cbind(seurat@meta.data, project_cxg)
+```
+
+```{r}
+# identify regions of epithelial cells
+fov_names <- c("fov", "fov.1", "fov.2", "fov.3", "fov.4")
+for(f in fov_names){
+  x_bounds <- c(0, max(seurat[[f]]@boundaries$centroids@coords[,1]))
+  y_bounds <- c(0, max(seurat[[f]]@boundaries$centroids@coords[,2]))
+  
+  p <- ImageDimPlot(seurat, fov = f, group.by = "seurat_clusters", axes = T) +
+    scale_x_continuous(breaks = seq(x_bounds[1], x_bounds[2], by = 200)) +
+    scale_y_continuous(breaks = seq(y_bounds[1], y_bounds[2], by = 200)) + 
+    theme(axis.text.x = element_text(angle = 30, vjust = 1, hjust=1))
+  ggsave(plot = p,
+         file = paste0(figure_dir, "/spatial_coordinates_", f, "_w_axes.png"),
+         height = unit(12, "in"), width = unit(12, "in"))
+    
+}
+```
+
+```{r}
+# define regions of interest containing epithelial clusters
+epithelial_coords <- list(
+  "x_1132_01" = c(2800, 3800), # fov.2
+  "y_1132_01" = c(3600, 4200), # fov.2
+  "x_1142_01" = c(2800, 3400), # fov.3
+  "y_1142_01" = c(4000, 5400), # fov.3
+  "x_1142_02" = c(4000, 4600), # fov.3
+  "y_1142_02" = c(3400, 4000), # fov.3
+  "x_1142_03" = c(3400, 4000), # fov.3
+  "y_1142_03" = c(5600, 6200), # fov.3
+  "x_1142_04" = c(1800, 2800), # fov.3
+  "y_1142_04" = c(4800, 5200), # fov.3
+  "x_1142_05" = c(4000, 4600), # fov.3
+  "y_1142_05" = c(5200, 5600), # fov.3
+  "x_1142_06" = c(2200, 2800), # fov.3
+  "y_1142_06" = c(4000, 4800), # fov.3
+  "x_1134_01" = c(2600, 3800), # fov.4
+  "y_1134_01" = c(2600, 4000), # fov.4
+  "x_1134_02" = c(2200, 3800), # fov.4
+  "y_1134_02" = c(4000, 4800), # fov.4
+  "x_1134_03" = c(4600, 5000), # fov.4
+  "y_1134_03" = c(2600, 3000) # fov.4
+)
+panin_crop_names <- c("panin01","panin02","panin03","panin04","panin05",
+                      "panin06","panin07","panin08","panin09","panin10")
+panin_crop_fov <- c("fov.2","fov.3","fov.3","fov.3","fov.3",
+                    "fov.3","fov.3","fov.4","fov.4","fov.4")
+panin_markers <- c("TFF1", "TFF2", "LYZ", "MUC5AC", "MUC6", "MUCL3", "IFI27",
+                   "CD55", "AGR2", "ANXA10", "CTSE", "PPDPF", "TSPAN1", "MUCL3",
+                   "SCD", "PGC", "ITGB4", "TOB1", "CD55", "IFI27", "GABRP",
+                   "SERPINA1")
+
+for(i in 1:length(panin_crop_names)){
+  name <- panin_crop_names[i]
+  fov <- panin_crop_fov[i]
+  x_coords <- epithelial_coords[[(2*i)-1]]
+  y_coords <- epithelial_coords[[(2*i)]]
+  print(name)
+  cropped.coords <- Crop(seurat[[fov]],
+                       x = x_coords, 
+                       y = y_coords,
+                       coords = "plot")
+  seurat[[name]] <- cropped.coords
+  DefaultBoundary(seurat[[name]]) <- "segmentation"
+  print("Crop complete")
+}
+
+for(i in 1:length(panin_crop_names)){
+  name <- panin_crop_names[i]
+  fov <- panin_crop_fov[i]
+  print(name)
+  
+  print("Louvain Clusters")
+  p_cluster <-
+    ImageDimPlot(seurat, fov = name, axes = TRUE, border.color = "white",
+             group.by = "seurat_clusters",
+             border.size = 0.1, cols = "polychrome", coord.fixed = FALSE)
+  ggsave(
+    plot = p_cluster,
+    filename = paste0(figure_dir, "/", fov, "_", name,
+                      "_louvain_clusters.png"),
+    height = unit(12, "in"), width = unit(12, "in"))
+  
+  print("Panin Feature Plot")
+  p_panin <- 
+    ImageDimPlot(seurat, fov = name, axes = TRUE, border.color = "white",
+                 group.by = "orig.ident", cols = "polychrome",
+                 border.size = 0.1, coord.fixed = FALSE,
+                 molecules = panin_markers,
+                 mols.cols = colorRamps::matlab.like2(length(panin_markers)),
+                 nmols = 10000)
+  ggsave(
+    plot = p_panin,
+    filename = paste0(figure_dir, "/", fov, "_", name,
+                      "_panin_markers.png"),
+    height = unit(12, "in"), width = unit(12, "in"))
+  
+  for(pat in paste0("Pattern_", 1:8)){
+    print(pat)
+    p <- 
+      ImageFeaturePlot(
+        seurat, fov = name, features = pat,
+        axes = TRUE, border.color = "#000000", border.size = 0.1) +
+      scale_fill_gradientn(colors = c("#FFFFFF", "#FF0000"),
+                           limits=c(min(seurat@meta.data[[pat]]), 
+                                    max(seurat@meta.data[[pat]])))
+    ggsave(
+      plot = p,
+      filename = paste0(figure_dir, "/", fov, "_", name,
+                      "_", pat, "_projection.png"),
+      height = unit(12, "in"), width = unit(12, "in"))
+  }
+}
+```
+
+```{r}
+# focused analysis of panin09 for presentation
+# create subfolder of figures for the pleanary session
+panin09_dir <- paste0(figure_dir, "/panin09_figures")
+if(!dir.exists(panin09_dir)){
+  dir.create(panin09_dir)
+}
+
+pancaf_genes <- c('LUM','DCN','COL1A1','VIM','CD39','S100A4','FAP','ACTA2','PDPN')
+iCAF_genes <- c('CXCL1','CXCL2','CCL2','CXCL12','PDGFRA','CFD','LMNA','DPT','HAS1','HAS2')
+myCAF_genes <- c('TAGLN','MYL9','TPM2','MMP11','POSTN','HOPX','TWIST1','SOX4')
+apCAF_genes <- c('HLA-DRA','HLA-DPA1','CD74','HLA-DQA1', "HLA-DQB1",'SLPI')
+
+T_cell_genes <- c("PTPRC", "CD3D", "CD3E", "CD3G", "IL7R", "IL2RA")
+CD4_T_genes <- c(T_cell_genes,
+                 "CD4")
+CD8_T_genes <- c(T_cell_genes,
+                 "CD8A")
+Treg_genes <- c(CD4_T_genes, "FOXP3")
+# genes not present in the xenium panel
+# CFD
+# HLA_DQB1
+rownames(seurat)[grepl("TNF", rownames(seurat))]
+
+features <- CD8_T_genes
+ImageDimPlot(seurat, fov = "panin09", axes = TRUE, border.color = "white",
+                 group.by = "orig.ident", cols = "polychrome",
+                 border.size = 0.1, coord.fixed = FALSE,
+                 molecules = features,
+                 mols.cols = colorRamps::matlab.like2(length(features)),
+                 nmols = 5000)
+
+# identify epithelial associated clusters
+# tentative clusters
+# 3: few epi
+# 12: normal ductal cells
+# 19: panin
+# 24: panin
+seurat <- PrepSCTFindMarkers(seurat)
+
+epi_clusters <- c(3, 12, 19, 24)
+
+de_res <- list()
+for(i in 1:length(epi_clusters)){
+  name <- as.character(epi_clusters[i])
+  de_res[[name]] <- 
+    FindMarkers(seurat, group.by = "seurat_clusters",
+                ident.1 = epi_clusters[i],
+                test.use = "wilcox")
+}
+# cluster 3 markers
+df <- de_res[["3"]]
+print(df[df$avg_log2FC > 1 & df$p_val_adj < 0.05,])
+write.csv(df,
+          file = paste0(result_dir, "/",
+                        "cluster_03",
+                        "_differentialExpression_wilcox.csv"))
+# cluster 12 markers
+df <- de_res[["12"]]
+print(df[df$avg_log2FC > 1 & df$p_val_adj < 0.05,])
+write.csv(df,
+          file = paste0(result_dir, "/",
+                        "cluster_12",
+                        "_differentialExpression_wilcox.csv"))
+# cluster 19 markers
+df <- de_res[["19"]]
+print(df[df$avg_log2FC > 1 & df$p_val_adj < 0.05,])
+write.csv(df,
+          file = paste0(result_dir, "/",
+                        "cluster_19",
+                        "_differentialExpression_wilcox.csv"))
+# cluster 24 markers
+df <- de_res[["24"]]
+print(df[df$avg_log2FC > 1 & df$p_val_adj < 0.05,])
+write.csv(df,
+          file = paste0(result_dir, "/",
+                        "cluster_24",
+                        "_differentialExpression_wilcox.csv"))
+
+features <- rownames(df[df$avg_log2FC > 1 & df$p_val_adj < 0.05,])
+ImageDimPlot(seurat, fov = "panin09", axes = TRUE, border.color = "white",
+                 group.by = "orig.ident", cols = "polychrome",
+                 border.size = 0.1, coord.fixed = FALSE,
+                 molecules = features,
+                 mols.cols = colorRamps::matlab.like2(length(features)),
+                 nmols = 5000)
+recode_epi <- c("cell",
+                "cell",
+                "cell",
+                "epithelial",
+                "cell",
+                "cell",
+                "cell",
+                "cell",
+                "cell",
+                "cell",
+                "cell",
+                "cell",
+                "epithelial",
+                "cell",
+                "cell",
+                "cell",
+                "cell",
+                "cell",
+                "cell",
+                "PanIN",
+                "cell",
+                "cell",
+                "cell",
+                "cell",
+                "PanIN",
+                "cell",
+                "cell",
+                "cell",
+                "cell",
+                "cell"
+                )
+names(recode_epi) <- as.character(0:29)
+recode_epi
+seurat$epi_cells <- plyr::mapvalues(seurat$seurat_clusters,
+                                    from = names(recode_epi),
+                                    to = recode_epi)
+
+for(i in 1:length(panin_crop_names)){
+  name <- panin_crop_names[i]
+  print(name)
+  p <-
+    ImageDimPlot(seurat, fov = name, axes = TRUE, border.color = "white",
+             group.by = "epi_cells",
+             border.size = 0.1, cols = "polychrome", coord.fixed = FALSE)
+  print(p)
+  ggsave(
+    plot = p,
+    filename = paste0(figure_dir, "/", fov, "_", name,
+                      "_epithelial_clusters.png"),
+    height = unit(12, "in"), width = unit(12, "in"))
+}
+
+
+# for(i in 1:length(fov_names)){
+#   name <- fov_names[i]
+#   print(name)
+#   p <-
+#     ImageDimPlot(seurat, fov = name, axes = TRUE, border.color = "white",
+#              group.by = "epi_cells",
+#              border.size = 0.1, cols = "polychrome", coord.fixed = FALSE)
+#   print(p)
+# }
+```
+
+```{r}
+# remove initial projection to all cells
+seurat@meta.data <- seurat@meta.data[,-grep("^Pattern", colnames(seurat@meta.data))]
+
+# project cogaps patterns onto epithelial clusters
+ser_epi <- seurat[,seurat$epi_cells %in% c("epithelial", "PanIN")]
+epi_projection <- projectR(ser_epi@assays$SCT@scale.data,
+                           loadings = cogaps@featureLoadings)
+saveRDS(epi_projection, file = paste0(result_dir, "/ProjectR_PDACAtlasPatterns_epithelial.rds"))
+epi_proj_cxg <- t(epi_projection)
+
+seurat@meta.data <- merge(seurat@meta.data, epi_proj_cxg, by = 0, all = T)
+rownames(seurat@meta.data) <- seurat@meta.data$Row.names
+seurat@meta.data <- seurat@meta.data[,-grep("Row.names", colnames(seurat@meta.data))]
+
+for(pat in paste0("Pattern_", 1:8)){
+  p <-
+    ImageFeaturePlot(
+      seurat, fov = "panin09", features = pat,
+      axes = TRUE, border.color = "#000000", border.size = 0.1) +
+    scale_fill_gradientn(colors = c("#FFFFFF", "#FF0000"),
+                         limits=c(min(seurat@meta.data[[pat]],na.rm=F), 
+                                  max(seurat@meta.data[[pat]],na.rm=F)))
+  print(p)
+  ggsave(
+    plot = p,
+    filename = paste0(panin09_dir, "/panin09_", pat, "_epithelial_projection.png"),
+    height = unit(12, "in"), width = unit(12, "in"))
+  ggsave(
+    plot = p,
+    filename = paste0(panin09_dir, "/panin09_", pat, "_epithelial_projection.pdf"),
+    height = unit(12, "in"), width = unit(12, "in"))
+}
+# highlight epithelial cells
+p <-
+    ImageDimPlot(seurat, fov = "panin09", axes = TRUE, border.color = "#000000",
+             group.by = "epi_cells",
+             border.size = 0.1, cols = c("#999999", "#EBF4A5", "#F2A93B"), coord.fixed = FALSE)
+print(p)
+ggsave(
+    plot = p,
+    filename = paste0(panin09_dir, "/panin09_epithelial_cell_annotation.png"),
+    height = unit(6, "in"), width = unit(12, "in"))
+ggsave(
+    plot = p,
+    filename = paste0(panin09_dir, "/panin09_epithelial_cell_annotation.pdf"),
+    height = unit(6, "in"), width = unit(12, "in"))
+
+xenium_featureplot <- function(seurat, features){
+  p <- ImageDimPlot(seurat, fov = "panin09", axes = TRUE, border.color = "white",
+                 group.by = "orig.ident", cols = "polychrome",
+                 border.size = 0.1, coord.fixed = FALSE,
+                 molecules = features,
+                 mols.cols = colorRamps::matlab.like2(length(features)),
+                 nmols = 5000)
+  return(p)
+}
+xenium_identity_plot <- function(seurat, identity, color){
+  p <- ImageDimPlot(seurat, fov = "panin09", axes = TRUE, border.color = "#000000",
+             group.by = identity,
+             border.size = 0.1, cols = c("#999999", color), coord.fixed = FALSE)
+  return(p)
+}
+
+# CAF markers
+p_pancaf <- xenium_featureplot(seurat, pancaf_genes)
+ggsave(
+    plot = p_pancaf,
+    filename = paste0(panin09_dir, "/panin09_", 
+                      "panCAF",
+                      "_markers.png"),
+    height = unit(6, "in"), width = unit(12, "in"))
+p_icaf <- xenium_featureplot(seurat, c(iCAF_genes, pancaf_genes))
+ggsave(
+    plot = p_icaf,
+    filename = paste0(panin09_dir, "/panin09_", 
+                      "iCAF",
+                      "_markers.png"),
+    height = unit(6, "in"), width = unit(12, "in"))
+p_mycaf <- xenium_featureplot(seurat, c(myCAF_genes, pancaf_genes))
+ggsave(
+    plot = p_mycaf,
+    filename = paste0(panin09_dir, "/panin09_", 
+                      "myCAF",
+                      "_markers.png"),
+    height = unit(6, "in"), width = unit(12, "in"))
+p_apcaf <- xenium_featureplot(seurat, c(apCAF_genes, pancaf_genes))
+ggsave(
+    plot = p_apcaf,
+    filename = paste0(panin09_dir, "/panin09_", 
+                      "apCAF",
+                      "_markers.png"),
+    height = unit(6, "in"), width = unit(12, "in"))
+# T cells
+p_cd4t <- xenium_featureplot(seurat, CD4_T_genes)
+ggsave(
+    plot = p_cd4t,
+    filename = paste0(panin09_dir, "/panin09_", 
+                      "CD4_T",
+                      "_markers.png"),
+    height = unit(6, "in"), width = unit(12, "in"))
+p_cd8t <- xenium_featureplot(seurat, CD8_T_genes)
+ggsave(
+    plot = p_cd8t,
+    filename = paste0(panin09_dir, "/panin09_", 
+                      "CD8_T",
+                      "_markers.png"),
+    height = unit(6, "in"), width = unit(12, "in"))
+p_treg <- xenium_featureplot(seurat, Treg_genes)
+ggsave(
+    plot = p_treg,
+    filename = paste0(panin09_dir, "/panin09_", 
+                      "T_reg",
+                      "_markers.png"),
+    height = unit(6, "in"), width = unit(12, "in"))
+
+# Identify T cells by gating on marker gene expression
+
+# base T cell markers
+Tcell_ident <-
+  apply(seurat@assays$Xenium@data, 2, function(x){
+    return(x[["PTPRC"]] >= 1 & (x[["CD3D"]] >= 1 | x[["CD3E"]] >= 1 | x[["CD3G"]] >= 1))
+  })
+seurat$Tcell_ident <- Tcell_ident
+
+# CD8 T cells
+cd8_T_ident <-
+  Tcell_ident &
+  apply(seurat@assays$Xenium@data, 2, function(x){
+    return(x[["CD8A"]] >= 1)
+  })
+seurat$CD8_T_ident <- cd8_T_ident
+
+# CD4 T cells
+CD4_T_genes
+cd4_T_ident <-
+  Tcell_ident &
+  apply(seurat@assays$Xenium@data, 2, function(x){
+    return(x[["CD4"]] >= 1)
+  })
+seurat$CD4_T_ident <- cd4_T_ident
+
+# Treg cells
+Treg_ident <-
+  cd4_T_ident &
+  apply(seurat@assays$Xenium@data, 2, function(x){
+    return(x[["FOXP3"]] >= 1)
+  })
+seurat$Treg_ident <- Treg_ident
+
+# highlight apCAFs
+CAF_ident <-
+  apply(seurat@assays$Xenium@data, 2, function(x){
+    (x[["LUM"]] >= 1 & x[["DCN"]] >= 1 & x[["COL1A1"]] >= 1 & x[["VIM"]] >= 1 &
+       x[["PTPRC"]] == 0) # exclude CD45+ cells
+  })
+seurat$CAF_ident <- CAF_ident
+
+apCAF_ident <- 
+  CAF_ident &
+  apply(seurat@assays$Xenium@data, 2, function(x){
+    (x[["CD74"]] >= 1 & (x[["HLA-DRA"]] >= 1 & x[["HLA-DPA1"]] >= 1 & x[["HLA-DQA1"]] >= 1))
+  })
+seurat$apCAF_ident <- apCAF_ident
+
+# monocyte/macrophage markers
+macrophage_markers <- c("PTPRC", "CD14", "FCGR3A", "ADGRE5", "HLA-DRA", "HLA-DPA1", "HLA-DQA1")
+macrophage_ident <-
+  apply(seurat@assays$Xenium@data, 2, function(x){
+    (x[["PTPRC"]] >= 1 & x[["CD14"]] >= 1 & x[["FCGR3A"]] >= 1)
+  })
+seurat$macrophage_ident <- macrophage_ident
+```
+
+```{r}
+save_identity_plot <- function(plot, identity){
+  ggsave(
+    plot = plot,
+    filename = paste0(panin09_dir, "/panin09_", 
+                      identity,
+                      "_identity.pdf"),
+    height = unit(6, "in"), width = unit(12, "in"))
+}
+save_feature_plot <- function(plot, identity){
+  ggsave(
+    plot = plot,
+    filename = paste0(panin09_dir, "/panin09_", 
+                      identity,
+                      "_markers.pdf"),
+    height = unit(6, "in"), width = unit(12, "in"))
+}
+
+p_Tcell_ident <- xenium_identity_plot(seurat, "Tcell_ident", "#AA00FF") +
+  ggtitle("T cells\nPTPRC+, CD3+")
+p_Tcell_mark <- xenium_featureplot(seurat, T_cell_genes)
+save_identity_plot(p_Tcell_ident, "Tcell")
+save_feature_plot(p_Tcell_mark, "Tcell")
+
+p_cd8T_ident <- xenium_identity_plot(seurat, "CD8_T_ident", "#0000FF") +
+  ggtitle("CD8+ T cells\nPTPRC+, CD3+, CD8A+")
+p_cd8T_mark <- xenium_featureplot(seurat, CD8_T_genes)
+save_identity_plot(p_cd8T_ident, "CD8_T_cell")
+save_feature_plot(p_cd8T_mark, "CD8_T_cell")
+
+p_cd4T_ident <- xenium_identity_plot(seurat, "CD4_T_ident", "#FF0000") +
+  ggtitle("CD4+ T cells\nPTPRC+, CD3+, CD4+")
+p_cd4T_mark <- xenium_featureplot(seurat, CD4_T_genes)
+save_identity_plot(p_cd4T_ident, "CD4_T_cell")
+save_feature_plot(p_cd4T_mark, "CD4_T_cell")
+
+p_Treg_ident <- xenium_identity_plot(seurat, "Treg_ident", "#FF00FF") +
+  ggtitle("T regulatory cells (Treg)\nPTPRC+, CD3+, CD4+, FOXP3+")
+p_Treg_mark <- xenium_featureplot(seurat, Treg_genes)
+save_identity_plot(p_Treg_ident, "Treg")
+save_feature_plot(p_Treg_mark, "Treg")
+
+p_pCAF_ident <- xenium_identity_plot(seurat, "CAF_ident", "#00FFFF") +
+  ggtitle("cancer assocaited fibroblast (CAF)\nLUM+, DCN+, COL1A1+, VIM+, PTPRC-")
+p_pCAF_mark <- xenium_featureplot(seurat, pancaf_genes)
+save_identity_plot(p_pCAF_ident, "CAF")
+save_feature_plot(p_pCAF_mark, "CAF")
+
+p_apCAF_ident <- xenium_identity_plot(seurat, "apCAF_ident", "#00FF00") +
+  ggtitle("antigen-presenting CAF (apCAF)\nLUM+, DCN+, COL1A1+, VIM+, PTPRC-,\nCD74+, HLA-DRA+, HLA-DPA1+, HLA-DQA1+")
+p_apCAF_mark <- xenium_featureplot(seurat, apCAF_genes)
+save_identity_plot(p_apCAF_ident, "apCAF")
+save_feature_plot(p_apCAF_mark, "apCAF")
+
+p_macro_ident <-xenium_identity_plot(seurat, "macrophage_ident", "#FFFF00") +
+  ggtitle("Macrophage\nPTPRC+, CD14+, FCGR3A+")
+p_macro_mark <- xenium_featureplot(seurat, macrophage_markers)
+save_identity_plot(p_macro_ident, "macrophage")
+save_feature_plot(p_macro_mark, "macrophage")
+```
+
+
+```{r}
+# save RDS with FOV fields saved and projected pattern weights
+saveRDS(seurat,
+        file = paste0(result_dir, "/Xenium_projectedPatterns.rds"))
+```
+

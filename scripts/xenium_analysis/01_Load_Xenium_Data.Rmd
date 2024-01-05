@@ -1,0 +1,134 @@
+---
+title: '01_Load_Xenium_Data'
+author: "Jacob Mitchell"
+date: "2023-04-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# new lib path for the most current version of Seurat that can use Xenium data
+# "~/FertigLab/Seurat_Xenium"
+# install.packages("Seurat", lib = "~/FertigLab/Seurat_Xenium")
+# install.packages("ggplot2", lib = "~/FertigLab/Seurat_Xenium")
+
+library(sp, lib.loc = "~/FertigLab/Seurat_Xenium")
+library(SeuratObject, lib.loc = "~/FertigLab/Seurat_Xenium")
+library(Seurat, lib.loc = "~/FertigLab/Seurat_Xenium")
+library(ggplot2, lib.loc = "~/FertigLab/Seurat_Xenium")
+library(reticulate)
+use_condaenv(condaenv = "panin_visium")
+
+set.seed(123)
+sessionInfo()
+```
+
+```{r}
+result_dir <- "processed_data/01_Load_Xenium_Data"
+if(!dir.exists(result_dir)){
+  dir.create(result_dir, recursive = T)
+}
+figure_dir <- "figures/01_Load_Xenium_Data"
+if(!dir.exists(figure_dir)){
+  dir.create(figure_dir, recursive = T)
+}
+```
+
+```{r}
+# paths to xenium data
+top_path <- "data/xenium_release_fertig_hpancreas_Mar31"
+panin_dirs <- list.dirs(top_path,recursive = F)[
+  grepl("^PanIN", list.dirs(top_path, full.names = F, recursive = F))]
+sample_names <- gsub(paste0(top_path,"/"), "", panin_dirs)
+
+ser_list <- list()
+assay <- "Xenium"
+fov <- "fov"
+for(i in 1:length(sample_names)){
+  data <- ReadXenium(
+    data.dir = panin_dirs[i],
+    type = c("centroids", "segmentations")
+  )
+  segmentations.data <- list(
+    "centroids" = CreateCentroids(data$centroids),
+    "segmentation" = CreateSegmentation(data$segmentations)
+  )
+  coords <- CreateFOV(
+    coords = segmentations.data,
+    type = c("segmentation", "centroids"),
+    molecules = data$microns,
+    assay = assay
+  )
+  xenium.obj <- CreateSeuratObject(counts = data$matrix[["Gene Expression"]], assay = assay)
+  xenium.obj[["BlankCodeword"]] <- CreateAssayObject(counts = data$matrix[["Unassigned Codeword"]]) # changed from source code
+  xenium.obj[["ControlCodeword"]] <- CreateAssayObject(counts = data$matrix[["Negative Control Codeword"]])
+  xenium.obj[["ControlProbe"]] <- CreateAssayObject(counts = data$matrix[["Negative Control Probe"]])
+  xenium.obj[[fov]] <- coords
+  print(sample_names[i])
+  print("Dimensions before removing empty cells")
+  print(dim(xenium.obj))
+  
+  xenium.obj <- subset(xenium.obj, subset = nCount_Xenium > 0)
+  print("Dimensions after removing empty cells")
+  print(dim(xenium.obj))
+  
+  ser_list[[sample_names[i]]] <- xenium.obj
+}
+
+# correction of mislabeled samples
+names(ser_list)
+# 1134 should be 1142
+# 1144 should be 1134
+names(ser_list) <- c("PanIN1131_S1A", "PanIN1131_S1C",
+                     "PanIN1132", "PanIN1142", "PanIN1134")
+
+a <- 1
+for(seurat in ser_list){
+  p <- ImageDimPlot(seurat, fov = "fov", 
+                    molecules = c("COL1A1", "TSPAN8", "TFF1", "CD8A"), 
+                    group.by = NULL,
+                    nmols = 1000)
+  print(p)
+  ggsave(plot = p,
+         filename = paste0(figure_dir, "/", names(ser_list)[a], "FOV_featureplot.png"),
+         width = unit(8, "in"), height = unit(8, "in"))
+  a <- a + 1
+}
+rm(a)
+
+# process each seurat object
+ser_processed <- list()
+
+for(i in 1:length(ser_list)){
+  seurat <- ser_list[[i]]
+  # append sample names to barcodes
+  seurat <- RenameCells(seurat,
+                        new.names = paste0(colnames(seurat), "_", names(ser_list)[i]))
+  seurat <- SCTransform(seurat, assay = "Xenium", clip.range = c(-10, 10), )
+  
+  # save processed Seurat object
+  saveRDS(seurat,
+          file = paste0(result_dir, "/Xenium_", names(ser_list)[i],
+                        "_SCT_processed.rds"))
+  ser_processed[[names(ser_list)[i]]] <- seurat
+}
+
+# combine the seurat objects for joined preprocessing
+
+seurat <- merge(ser_processed[[1]],
+                c(ser_processed[[2]],
+                  ser_processed[[3]],
+                  ser_processed[[4]],
+                  ser_processed[[5]]))
+
+seurat <- RunPCA(seurat, npcs = 30, features = rownames(seurat))
+seurat <- RunUMAP(seurat, dims = 1:30)
+seurat <- FindNeighbors(seurat, reduction = "pca", dims = 1:30)
+seurat <- FindClusters(seurat, resolution = 1)
+
+# save merged object of processed xenium images
+saveRDS(seurat, file = paste0(result_dir, "/Xenium_combined_SCT_processed.rds"))
+```

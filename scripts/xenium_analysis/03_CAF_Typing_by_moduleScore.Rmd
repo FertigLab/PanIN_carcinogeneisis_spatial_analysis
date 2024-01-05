@@ -1,0 +1,1354 @@
+---
+title: "03_CAF_Typing_by_moduleScore"
+author: "Jacob Mitchell"
+date: "2023-11-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(sp, lib.loc = "~/FertigLab/Seurat_Xenium")
+library(SeuratObject, lib.loc = "~/FertigLab/Seurat_Xenium")
+library(Seurat, lib.loc = "~/FertigLab/Seurat_Xenium")
+library(ggplot2, lib.loc = "~/FertigLab/Seurat_Xenium")
+library(mixtools)
+library(ggpubr)
+library(colorRamps)
+library(tidyverse)
+library(plyr)
+library(dplyr)
+library(scales)
+
+set.seed(123)
+sessionInfo()
+```
+
+```{r}
+result_dir <- "processed_data/03_CAF_Typing_by_moduleScore"
+if(!dir.exists(result_dir)){
+  dir.create(result_dir)
+}
+figure_dir <- "figures/03_CAF_Typing_by_moduleScore"
+if(!dir.exists(figure_dir)){
+  dir.create(figure_dir)
+}
+spatial_dir <- paste0(figure_dir, "/spatial_plots")
+if(!dir.exists(spatial_dir)) {
+  dir.create(spatial_dir)
+}
+```
+
+```{r functions}
+xenium_identity_plot <- function(seurat, identity, color, fov){
+  p <- ImageDimPlot(seurat, fov = fov, axes = TRUE, border.color = "#000000",
+             group.by = identity,
+             border.size = 0.1, cols = c("FALSE"="#999999", "TRUE"=color), coord.fixed = FALSE)
+  return(p)
+}
+xenium_featureplot <- function(seurat, features, fov, ...){
+  p <- ImageDimPlot(seurat, fov = fov, axes = TRUE, border.color = "white",
+                 group.by = "orig.ident", cols = "polychrome",
+                 border.size = 0.1, coord.fixed = FALSE,
+                 molecules = features,
+                 mols.cols = colorRamps::matlab.like2(length(features)),
+                 nmols = 5000, ...)
+  return(p)
+}
+save_identity_plot <- function(plot, identity){
+  ggsave(
+    plot = plot,
+    filename = paste0(figure_dir, "/", 
+                      identity,
+                      "_identity.pdf"),
+    height = unit(6, "in"), width = unit(12, "in"))
+}
+
+save_feature_plot <- function(plot, identity){
+  ggsave(
+    plot = plot,
+    filename = paste0(figure_dir, "/", 
+                      identity,
+                      "_markers.pdf"),
+    height = unit(6, "in"), width = unit(12, "in"))
+}
+save_umap_png <- function(plot, name){
+  ggsave(
+    plot = plot,
+    filename = paste0(figure_dir, "/umap_", 
+                      name,
+                      ".png"),
+    height = unit(8, "in"), width = unit(8, "in"))
+}
+
+stack_cell_porportions <- function(seurat, group.by.x, group.by.stack){
+  cell_meta_data <- seurat@meta.data
+  # x axis labels
+  x.group <- unique(cell_meta_data[[group.by.x]])
+  # groups in stacks
+  stack.group <- unique(cell_meta_data[[group.by.stack]])
+  
+  prop <- data.frame(x.group = x.group)
+  
+  # count cells in x groups
+  prop[["total_count"]] <- sapply(
+    x.group, 
+    function(x){
+      nrow(cell_meta_data[cell_meta_data[[group.by.x ]] == x,]
+      )
+    }
+  )
+  for(type in stack.group){
+    prop[[paste0(type, "_count")]] <- sapply(
+      x.group, 
+      function(x){
+        nrow(cell_meta_data[cell_meta_data[[group.by.x]] == x &
+                              cell_meta_data[[group.by.stack]] == type,]
+        )
+      }
+    )
+  }
+  # convert counts to a proportion
+  cluster_counts <- colnames(prop)[-1:-2]
+  for(i in cluster_counts){
+    proportion <- gsub("_count$", "_proportion", i)
+    prop[[proportion]] <- prop[[i]]/prop[["total_count"]]
+  }
+  # reorient to long data frame
+  columns <- colnames(prop)[grep("proportion$", colnames(prop))]
+  prop_stacked <- pivot_longer(prop, cols = columns,
+                               names_to = group.by.stack,
+                               values_to = "proportion")
+  prop_stacked[[group.by.stack]] <- gsub("_proportion$", "", prop_stacked[[group.by.stack]])
+  return(prop_stacked)
+}
+
+plot_stack <- function(prop_stacked, group.by.x, group.by.stack, fill.palette = NULL, label.percentage = FALSE){ 
+  if(is.null(fill.palette)){
+    stack.group <- unique(prop_stacked[[group.by.stack]])
+    fill.palette <- scales::hue_pal()(length(stack.group))
+    names(fill.palette) <- stack.group
+  }
+  stack_plot <-
+    ggplot(prop_stacked, 
+           aes(x = x.group, 
+               y = proportion, 
+               fill = .data[[group.by.stack]])) +
+    geom_bar(position = "fill", stat = "identity") +
+    scale_fill_manual(values = fill.palette) +
+    ylab("Cell proportion") +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 25, vjust = 1, hjust=1),
+          axis.title.x = element_blank())
+  if(label.percentage){
+    stack_plot <- stack_plot +
+      geom_text(
+        aes(
+          label=paste0(signif(.data[["proportion"]]*100,3), "%")
+        ),
+        position=position_fill(vjust=0.5), colour="#FFFFFF"
+      )
+  }
+  
+  return(stack_plot)
+}
+
+arrange_score_dist <- function(seurat, feature, group.by, bins, threshold = NULL){
+  pl_hist <- ggplot(
+    seurat@meta.data, aes(x = .data[[feature]], fill = .data[[group.by]])
+    ) +
+    geom_histogram(bins = bins) +
+    theme_bw() +
+    theme(legend.position = "bottom")
+  pl_freqpoly <- ggplot(
+    seurat@meta.data, aes(x = .data[[feature]], color = .data[[group.by]])
+  ) +
+    geom_freqpoly(bins = bins) +
+    theme_bw() +
+    theme(legend.position = "none")
+  
+  if(!is.null(threshold)){
+    pl_hist <- pl_hist +
+      geom_vline(xintercept = threshold, color = "#000000", linetype = 2)
+    pl_freqpoly <- pl_freqpoly +
+      geom_vline(xintercept = threshold, color = "#000000", linetype = 2)
+  }
+  
+  pl_arrange <- ggarrange(
+    pl_freqpoly, pl_hist,
+    nrow = 2
+  )
+  return(pl_arrange)
+}
+
+plot_score_density_2d <- function(df, x, y){
+  scale_min <- min(df[[x]], df[[y]])
+  scale_max <- max(df[[x]], df[[y]])
+  pl <- ggplot(df, aes(x = .data[[x]], y = .data[[y]])) +
+    stat_density2d(aes(fill = ..level..), geom = "polygon", color = "#FFFFFF") +
+    # geom_bin2d(bins = 100) +
+    scale_fill_continuous(type="viridis") +
+    lims(
+      x = c(scale_min, scale_max), 
+      y = c(scale_min, scale_max)
+    )
+  return(pl)
+}
+```
+
+```{r gene sets}
+CAF_modscore_genes <- list(
+  "panCAF" = c("FAP",'LUM','DCN','COL1A1')
+)
+apCAF_modscore_genes <- list(
+  "apCAF" = c("CD74", "HLA-DRA", "HLA-DPA1", "HLA-DQA1", "SLPI")
+)
+iCAF_modscore_genes <- list(
+  "iCAF" = c('CXCL1','CXCL2','CCL2','LMNA','HAS1','HAS2')
+)
+myCAF_modscore_genes <- list(
+  "myCAF" = c('TAGLN','MYL9','TPM2','MMP11','HOPX','TWIST1','SOX4')
+)
+```
+
+```{r}
+# Load Seurat object with FOVs targeting epithelium and projected CoGAPS patterns
+seurat <- readRDS("processed_data/02_Pattern_Projection/Xenium_projectedPatterns.rds")
+
+# reorder rows to match cell order in expression data
+seurat@meta.data <- seurat@meta.data[colnames(seurat@assays$SCT@data),]
+
+# segment identifier using cell barcodes
+seurat$ID <- gsub("^.{11}", "", rownames(seurat@meta.data))
+id_dict <- data.frame(
+  "ID" = c("PanIN1131_S1A", "PanIN1131_S1C", "PanIN1132", "PanIN1134", "PanIN1142"),
+  "segment" = c("PanIN-LG1-1", "PanIN-LG1-2", "PanIN-HG1-1", "PanIN-HG2-1", "PanIN-HG3-1")
+)
+seurat$segment <- plyr::mapvalues(
+  x = seurat$ID,
+  from = id_dict$ID,
+  to = id_dict$segment
+)
+```
+
+```{r panCAF module score}
+seurat <- AddModuleScore(
+  object = seurat, features = CAF_modscore_genes,
+  nbin = 24, ctrl = 15, name = 'panCAF_module_score', search = FALSE, assay = "SCT"
+)
+
+umap_all_cafScore <- FeaturePlot(seurat, features = "panCAF_module_score1") +
+  scale_color_viridis_c(
+    option = "viridis",
+  )
+print(umap_all_cafScore)
+ggsave(
+  plot = umap_all_cafScore,
+  filename = paste0(figure_dir, "/umap_allCells_CAF_moduleScore.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+ggsave(
+  plot = umap_all_cafScore + theme(legend.position = "none"),
+  filename = paste0(figure_dir, "/umap_allCells_CAF_moduleScore", "_noLegend", ".pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+
+hist_all_cafScore <- ggplot(
+  seurat@meta.data, aes(x = panCAF_module_score1, fill = segment)
+) +
+  geom_histogram(bins = 100)
+print(hist_all_cafScore)
+
+feqpoly_all_seg_cafScore <- ggplot(
+  seurat@meta.data, aes(x = panCAF_module_score1, color = segment)
+) +
+  geom_freqpoly(bins = 100)
+print(feqpoly_all_seg_cafScore)
+
+# reviewing the H&E images of the segments being scored, the plateaus of high
+# CAF scores (>0) from PanIN1134 and PanIN1142 make sense as these segments
+# have some of the most fibrosis and least adipose tissue. 
+```
+
+```{r CAF cell type identity threshold}
+# assessing multi-modal distribution with mixtools
+CAF_scores <- seurat$panCAF_module_score1
+
+k_values <- c(2,3)
+
+mixModels <- list()
+set.seed(123)
+for(i in seq_along(k_values)){
+  k <- k_values[i]
+  print(k)
+  mod <- normalmixEM(x = CAF_scores, k = k)
+  mixModels[[paste0("k_", k)]] <- mod
+}
+
+# mixture model fails to converge at k >= 4
+summary(mixModels$k_2)
+plot(mixModels$k_2, which = 2, breaks = 50)
+
+summary(mixModels$k_3)
+plot(mixModels$k_3, which = 2, breaks = 50)
+
+# The model expecting 3 gausian distributions best fits the data among convergent solutions
+
+mod <- mixModels$k_3
+mixedMod_df <- data.frame(
+  x = mod$x
+)
+components <- colnames(mod$posterior)
+for(i in seq_along(components)){
+  comp <- components[i]
+  # draw gausian distributions with parameters of model fit
+  pred <- dnorm(
+    x = mixedMod_df$x,
+    mean = mod$mu[i],
+    sd = mod$sigma[i]
+  )
+  mixedMod_df[[comp]] <- pred
+}
+mixedMod_df$prediction_sum <- rowSums(mixedMod_df[,components])
+
+ggplot(mixedMod_df, aes(x = x)) +
+  geom_histogram(
+    aes(y = after_stat(density)), 
+    bins = 100, fill = "white", color = "black"
+  ) +
+  geom_line(aes(y = prediction_sum), color = "black", linewidth = 2) +
+  geom_line(aes(y = .data[[components[1]]]), color = "red", linewidth = 1) +
+  geom_line(aes(y = .data[[components[2]]]), color = "green", linewidth = 1) +
+  geom_line(aes(y = .data[[components[3]]]), color = "blue", linewidth = 1)
+
+# with the goal of adjusting the threshold of calling CAF cells while still deciding
+# the threshold based on features of the data, the threshold will be established at
+# the CAF score value one standard deviation below the mean of the 3rd component Gaussian distribution.
+  
+threshold <- mod$mu[1] - mod$sigma[1]
+cat(paste0("CAF score threshold:\n", threshold))
+
+dist_cafScore_arrange <- arrange_score_dist(
+  seurat, feature = "panCAF_module_score1", group.by = "segment",
+  bins = 100, threshold = threshold
+)
+dist_cafScore_arrange
+
+plot(mod, which = 2, breaks = 100)
+abline(v=threshold, col="#000000", lty=1, lwd=2)
+
+pdf(
+  file = paste0(figure_dir, "/scoreDistribution_MixedFit",".pdf"),
+  width = 8, height = 6
+)
+plot(mod, which = 2, breaks = 100)
+dev.off()
+
+pdf(
+  file = paste0(figure_dir, "/scoreDistribution_MixedFit","_threshold", ".pdf"),
+  width = 8, height = 6
+)
+plot(mod, which = 2, breaks = 100)
+abline(v=threshold, col="#000000", lty=8, lwd=2)
+dev.off()
+
+pdf(
+  file = paste0(figure_dir, "/scoreDistribution_noFit", ".pdf"),
+  width = 8, height = 6
+)
+hist(CAF_scores, breaks = 100)
+dev.off()
+```
+
+```{r annotate CAFs and CD45 pos}
+# annotate PTPRC (CD45) expression in seurat@meta.data
+seurat$PTPRC_expression <- seurat@assays$SCT@data["PTPRC", rownames(seurat@meta.data)]
+seurat$CD45_pos <- seurat$PTPRC_expression > 0
+
+# Annotate CAF cells by module score above the established threshold
+seurat$CAF_score_high <- seurat$panCAF_module_score1 > threshold
+seurat$CAF_identity <- seurat$CAF_score_high & !seurat$CD45_pos
+
+# representative plots of CAF gene and PTPRC expression in identified cells
+vln_plot_genes <- c(CAF_modscore_genes$panCAF, "PTPRC")
+for(i in seq_along(vln_plot_genes)){
+  g <- vln_plot_genes[i]
+  vln_pl <- VlnPlot(
+    seurat,
+    features = g,
+    group.by = "CAF_identity",
+    pt.size = 0
+  ) +
+    labs(x = "CAF Identity") +
+    theme(legend.position = "none")
+  ggsave(
+    plot = vln_pl,
+    filename = paste0(figure_dir, "/vln_", g, "_CAFidentity", ".pdf"),
+    width = unit(4, "in"), height = unit(4, "in")
+  )
+}
+```
+
+```{r total CAF proportions}
+# proportions of cells in each cluster identified as CAFs
+CAF_prop <- stack_cell_porportions(seurat, group.by.x = "seurat_clusters", group.by.stack = "CAF_identity")
+pl_CAF_prop <- plot_stack(CAF_prop, group.by.x = "seurat_clusters", group.by.stack = "CAF_identity") +
+  scale_fill_manual(values = c("TRUE" = "#FF0000", "FALSE" = "#999999"))
+ggsave(
+  plot = pl_CAF_prop, 
+  filename = paste0(figure_dir, "/stack_barplot_CAFproportions_seuratClusters.pdf"),
+  width = unit(8, "in"), height = unit(6, "in")
+)
+
+CAF_prop_segment <- stack_cell_porportions(seurat, group.by.x = "segment", group.by.stack = "CAF_identity")
+pl_CAF_prop_segment <- plot_stack(CAF_prop_segment , group.by.x = "segment", group.by.stack = "CAF_identity", label.percentage = TRUE) +
+  scale_fill_manual(values = c("TRUE" = "#FF0000", "FALSE" = "#999999"))
+ggsave(
+  plot = pl_CAF_prop_segment, 
+  filename = paste0(figure_dir, "/stack_barplot_CAFproportions_segment.pdf"),
+  width = unit(6, "in"), height = unit(8, "in")
+)
+ggsave(
+  plot = pl_CAF_prop_segment + theme(legend.position = "none"), 
+  filename = paste0(figure_dir, "/stack_barplot_CAFproportions_segment_noLegend.pdf"),
+  width = unit(6, "in"), height = unit(8, "in")
+)
+
+# UMAP labels of CAFs
+umap_clusters <- DimPlot(seurat, group.by = "seurat_clusters")
+ggsave(
+  plot = umap_clusters,
+  filename = paste0(figure_dir, "/umap_seuratClusters.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+ggsave(
+  plot = umap_clusters + theme(legend.position = "none"),
+  filename = paste0(figure_dir, "/umap_seuratClusters_noLegend.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+
+umap_segment <- DimPlot(seurat, group.by = "segment")
+ggsave(
+  plot = umap_segment,
+  filename = paste0(figure_dir, "/umap_segment.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+ggsave(
+  plot = umap_segment + theme(legend.position = "none"),
+  filename = paste0(figure_dir, "/umap_segment_noLegend.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+
+umap_CAF_ident <- DimPlot(seurat, group.by = "CAF_identity") +
+  scale_color_manual(values = c("TRUE" = "#FF0000", "FALSE" = "#999999"))
+ggsave(
+  plot = umap_CAF_ident,
+  filename = paste0(figure_dir, "/umap_CAFidentity.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+ggsave(
+  plot = umap_CAF_ident + theme(legend.position = "none"),
+  filename = paste0(figure_dir, "/umap_CAFidentity_noLegend.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+```
+
+```{r annotation of CAF subtypes}
+ser_caf <- seurat[,seurat$CAF_identity == TRUE]
+ser_caf <- RunPCA(ser_caf, features = rownames(ser_caf))
+ser_caf <- FindNeighbors(ser_caf)
+ser_caf <- RunUMAP(ser_caf, dims = 1:30)
+# compute CAF subtype module scores
+ser_caf<- AddModuleScore(
+  ser_caf, features = apCAF_modscore_genes, 
+  name = "apCAF_module_score", nbin = 24, ctrl = 15, search = FALSE, assay = "SCT"
+)
+ser_caf<- AddModuleScore(
+  ser_caf, features = iCAF_modscore_genes, 
+  name = "iCAF_module_score", nbin = 24, ctrl = 15, search = FALSE, assay = "SCT"
+)
+ser_caf<- AddModuleScore(
+  ser_caf, features = myCAF_modscore_genes, 
+  name = "myCAF_module_score", nbin = 24, ctrl = 15, search = FALSE, assay = "SCT"
+)
+```
+
+```{r CAF subtype plots}
+# CAF umap plots
+umap_caf_clusters <- DimPlot(ser_caf, group.by = "seurat_clusters")
+ggsave(
+  plot = umap_caf_clusters,
+  filename = paste0(figure_dir, "/caf_umap_clusters.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+ggsave(
+  plot = umap_caf_clusters + theme(legend.position = "none"),
+  filename = paste0(figure_dir, "/caf_umap_clusters_noLegend.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+
+umap_caf_segment <- DimPlot(ser_caf, group.by = "segment")
+ggsave(
+  plot = umap_caf_segment,
+  filename = paste0(figure_dir, "/caf_umap_segment.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+ggsave(
+  plot = umap_caf_segment + theme(legend.position = "none"),
+  filename = paste0(figure_dir, "/caf_umap_segment_noLegend.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+
+umap_caf_apCAFscore <- FeaturePlot(ser_caf, features = "apCAF_module_score1") +
+  scale_colour_gradientn(colours = scales::viridis_pal(option="magma")(10))
+ggsave(
+  plot = umap_caf_apCAFscore,
+  filename = paste0(figure_dir, "/caf_umap_apCAFscore.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+ggsave(
+  plot = umap_caf_apCAFscore + theme(legend.position = "none"),
+  filename = paste0(figure_dir, "/caf_umap_apCAFscore_noLegend.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+
+umap_caf_iCAFscore <- FeaturePlot(ser_caf, features = "iCAF_module_score1") +
+  scale_colour_gradientn(colours = scales::viridis_pal(option="magma")(10))
+ggsave(
+  plot = umap_caf_iCAFscore,
+  filename = paste0(figure_dir, "/caf_umap_iCAFscore.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+ggsave(
+  plot = umap_caf_iCAFscore + theme(legend.position = "none"),
+  filename = paste0(figure_dir, "/caf_umap_iCAFscore_noLegend.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+
+umap_caf_myCAFscore <- FeaturePlot(ser_caf, features = "myCAF_module_score1") +
+  scale_colour_gradientn(colours = scales::viridis_pal(option="magma")(10))
+ggsave(
+  plot = umap_caf_myCAFscore,
+  filename = paste0(figure_dir, "/caf_umap_myCAFscore.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+ggsave(
+  plot = umap_caf_myCAFscore + theme(legend.position = "none"),
+  filename = paste0(figure_dir, "/caf_umap_myCAFscore_noLegend.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+
+# violin plots of score distribution by cluster
+pl_vln_apCAF_cluster <- VlnPlot(
+  ser_caf, group.by = "seurat_clusters", 
+  features = "apCAF_module_score1", pt.size = 0
+) + 
+  xlab("seurat_clusters") +
+  lims(y = c(-0.5,2)) +
+  theme(legend.position = "bottom")
+ggsave(
+  plot = pl_vln_apCAF_cluster,
+  filename = paste0(figure_dir, "/caf_vln_apCAFscore_cluster.pdf"),
+  width = unit(8, "in"), height = unit(6, "in")
+)
+
+pl_vln_iCAF_cluster <- VlnPlot(
+  ser_caf, group.by = "seurat_clusters", 
+  features = "iCAF_module_score1", pt.size = 0
+) + 
+  xlab("seurat_clusters") +
+  lims(y = c(-0.5,2)) +
+  theme(legend.position = "bottom")
+ggsave(
+  plot = pl_vln_iCAF_cluster,
+  filename = paste0(figure_dir, "/caf_vln_iCAFscore_cluster.pdf"),
+  width = unit(8, "in"), height = unit(6, "in")
+)
+
+pl_vln_myCAF_cluster <- VlnPlot(
+  ser_caf, group.by = "seurat_clusters", 
+  features = "myCAF_module_score1", pt.size = 0
+) + 
+  xlab("seurat_clusters") +
+  lims(y = c(-0.5,2)) +
+  theme(legend.position = "bottom")
+ggsave(
+  plot = pl_vln_myCAF_cluster,
+  filename = paste0(figure_dir, "/caf_vln_myCAFscore_cluster.pdf"),
+  width = unit(8, "in"), height = unit(6, "in")
+)
+
+# distribution of module scores
+hist_caf_apScore <- ggplot(
+  ser_caf@meta.data, aes(x = apCAF_module_score1, fill = segment)
+) +
+  geom_histogram(bins = 20)
+print(hist_caf_apScore)
+
+feqpoly_caf_seg_apScore <- ggplot(
+  ser_caf@meta.data, aes(x = apCAF_module_score1, color = segment)
+) +
+  geom_freqpoly(bins = 100)
+print(feqpoly_caf_seg_apScore)
+
+# distributions of scores
+pl_dist_caf_apCAF <- arrange_score_dist(
+  ser_caf, feature = "apCAF_module_score1", group.by = "segment", bins = 100, threshold = 0
+)
+ggsave(
+  plot = pl_dist_caf_apCAF,
+  filename = paste0(figure_dir, "/apCAFscore_distribution_arrange.pdf"),
+  width = unit(8, "in"), height = unit(6, "in")
+)
+
+pl_dist_caf_iCAF <- arrange_score_dist(
+  ser_caf, feature = "iCAF_module_score1", group.by = "segment", bins = 100, threshold = 0
+)
+ggsave(
+  plot = pl_dist_caf_iCAF,
+  filename = paste0(figure_dir, "/iCAFscore_distribution_arrange.pdf"),
+  width = unit(8, "in"), height = unit(6, "in")
+)
+
+pl_dist_caf_myCAF <- arrange_score_dist(
+  ser_caf, feature = "myCAF_module_score1", group.by = "segment", bins = 100, threshold = 0
+)
+ggsave(
+  plot = pl_dist_caf_myCAF,
+  filename = paste0(figure_dir, "/myCAFscore_distribution_arrange.pdf"),
+  width = unit(8, "in"), height = unit(6, "in")
+)
+
+# pairwise assement of score corelation
+lm_ap_i <- lm(data = ser_caf@meta.data, formula = apCAF_module_score1 ~ iCAF_module_score1)
+summary(lm_ap_i)
+
+lm_ap_my <- lm(data = ser_caf@meta.data, formula = apCAF_module_score1 ~ myCAF_module_score1)
+summary(lm_ap_my)
+
+pl_dens_apCAF_v_iCAF <- plot_score_density_2d(
+  df = ser_caf@meta.data,
+  x = "iCAF_module_score1",
+  y = "apCAF_module_score1"
+)
+ggsave(
+  plot = pl_dens_apCAF_v_iCAF + theme(legend.position = "none"),
+  filename = paste0(figure_dir, "/2DscoreDensity_", "iCAF", "_v_", "apCAF", ".pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+
+pl_dens_apCAF_v_myCAF <- plot_score_density_2d(
+  df = ser_caf@meta.data,
+  x = "myCAF_module_score1",
+  y = "apCAF_module_score1"
+)
+ggsave(
+  plot = pl_dens_apCAF_v_myCAF + theme(legend.position = "none"),
+  filename = paste0(figure_dir, "/2DscoreDensity_", "myCAF", "_v_", "apCAF", ".pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+
+pl_dens_apCAF_v_iCAF_thresh <- pl_dens_apCAF_v_iCAF +
+  geom_vline(xintercept = 0, color = "#FF0000", linetype = 1) +
+  geom_hline(yintercept = 0, color = "#FF0000", linetype = 1)
+ggsave(
+  plot = pl_dens_apCAF_v_iCAF_thresh + theme(legend.position = "none"),
+  filename = paste0(figure_dir, "/2DscoreDensity_", "threshold_",
+                    "iCAF", "_v_", "apCAF", ".pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+pl_dens_apCAF_v_myCAF_thresh <- pl_dens_apCAF_v_myCAF +
+  geom_vline(xintercept = 0, color = "#FF0000", linetype = 1) +
+  geom_hline(yintercept = 0, color = "#FF0000", linetype = 1)
+ggsave(
+  plot = pl_dens_apCAF_v_myCAF_thresh + theme(legend.position = "none"),
+  filename = paste0(figure_dir, "/2DscoreDensity_", "threshold_",
+                    "myCAF", "_v_", "apCAF", ".pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+```
+
+```{r}
+# identification of CAF subtypes by module score thresholding
+
+## threshold rationale
+# With strict thresholding on the identification of the CAF cell type overall,
+# the subtyping uses less strict thresholding of 0 to call a CAF as a specific
+# subtype (iCAF, myCAF, apCAF). If a CAF is above thresholds for more than one
+# subtype, the higher score determines the identity label. CAFs below all thresholds
+# are labeled as CAF.
+
+iCAF_threshold <- 0
+myCAF_threshold <- 0
+apCAF_threshold <- 0
+
+modscore_df <- ser_caf@meta.data[
+  ,grepl("_module_score1$", colnames(ser_caf@meta.data)) & 
+    !grepl("^pan", colnames(ser_caf@meta.data))]
+modscore_df$max_score_index <- apply(modscore_df,1,which.max)
+modscore_df$CAF_subtype_ident <- sapply(
+  rownames(modscore_df),
+  function(barcode){
+    df_row <- modscore_df[barcode, ]
+    max_index <- df_row[["max_score_index"]]
+    max_score <- df_row[[max_index]]
+    if(max_score > iCAF_threshold){
+      res_name <- gsub("_module_score1$", "", colnames(modscore_df)[[max_index]])
+      return(res_name)
+    } else {
+      return("CAF")
+    }
+  }
+)
+ser_caf$CAF_subtype_ident <- factor(
+  modscore_df$CAF_subtype_ident,
+  levels = c("CAF", "iCAF", "myCAF", "apCAF")
+)
+
+# visualize typing on UMAP
+caf_pallete <- c(
+  "CAF" = "#CC79A7",
+  "iCAF" = "#E69F00",
+  "myCAF" = "#56B4E9",
+  "apCAF" = "#009E73"
+)
+
+umap_caf_subtype <- DimPlot(ser_caf, group.by = "CAF_subtype_ident") +
+  scale_color_manual(values = caf_pallete)
+ggsave(
+  plot = umap_caf_subtype,
+  filename = paste0(figure_dir, "/caf_umap_CAFsubtype.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+ggsave(
+  plot = umap_caf_subtype + theme(legend.position = "none"),
+  filename = paste0(figure_dir, "/caf_umap_CAFsubtype_noLegend.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+
+# umap plots showing individual CAF types
+umap_CAF_subtype <- DimPlot(
+  ser_caf[,ser_caf$CAF_subtype_ident == "CAF"], 
+  group.by = "CAF_subtype_ident") +
+  scale_color_manual(values = caf_pallete)
+umap_iCAF_subtype <- DimPlot(
+  ser_caf[,ser_caf$CAF_subtype_ident == "iCAF"], 
+  group.by = "CAF_subtype_ident") +
+  scale_color_manual(values = caf_pallete)
+umap_myCAF_subtype <- DimPlot(
+  ser_caf[,ser_caf$CAF_subtype_ident == "myCAF"], 
+  group.by = "CAF_subtype_ident") +
+  scale_color_manual(values = caf_pallete)
+umap_apCAF_subtype <- DimPlot(
+  ser_caf[,ser_caf$CAF_subtype_ident == "apCAF"], 
+  group.by = "CAF_subtype_ident") +
+  scale_color_manual(values = caf_pallete)
+
+ggsave(
+  plot = umap_CAF_subtype + theme(legend.position = "none"),
+  filename = paste0(figure_dir, "/caf_umap_CAFsubtype_CAF.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+ggsave(
+  plot = umap_iCAF_subtype + theme(legend.position = "none"),
+  filename = paste0(figure_dir, "/caf_umap_CAFsubtype_iCAF.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+ggsave(
+  plot = umap_myCAF_subtype + theme(legend.position = "none"),
+  filename = paste0(figure_dir, "/caf_umap_CAFsubtype_myCAF.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+ggsave(
+  plot = umap_apCAF_subtype + theme(legend.position = "none"),
+  filename = paste0(figure_dir, "/caf_umap_CAFsubtype_apCAF.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+
+# stacked barplots of CAF subtype representation
+CAF_sub_prop <- stack_cell_porportions(
+  ser_caf, group.by.x = "segment", group.by.stack = "CAF_subtype_ident"
+)
+CAF_sub_prop$CAF_subtype_ident <- factor(
+  CAF_sub_prop$CAF_subtype_ident, levels = levels(ser_caf$CAF_subtype_ident)
+)
+pl_CAF_sub_prop <- plot_stack(
+  CAF_sub_prop, group.by.x = "segment", group.by.stack = "CAF_subtype_ident",
+  fill.palette = caf_pallete, label.percentage = TRUE
+)
+ggsave(
+  plot = pl_CAF_sub_prop,
+  filename = paste0(figure_dir, "/stack_barplot_CAFsubtype_segment.pdf"),
+  width = unit(6, "in"), height = unit(8, "in")
+)
+ggsave(
+  plot = pl_CAF_sub_prop + theme(legend.position = "none"),
+  filename = paste0(figure_dir, "/stack_barplot_CAFsubtype_segment_noLegend.pdf"),
+  width = unit(6, "in"), height = unit(8, "in")
+)
+
+CAF_sub_cluster_prop <- stack_cell_porportions(
+  ser_caf, group.by.x = "seurat_clusters", group.by.stack = "CAF_subtype_ident"
+)
+CAF_sub_cluster_prop$CAF_subtype_ident <- factor(
+  CAF_sub_cluster_prop$CAF_subtype_ident, levels = levels(ser_caf$CAF_subtype_ident)
+)
+pl_CAF_sub_cluster_prop <- plot_stack(
+  CAF_sub_cluster_prop, group.by.x = "seurat_clusters", group.by.stack = "CAF_subtype_ident",
+  fill.palette = caf_pallete, label.percentage = FALSE
+)
+ggsave(
+  plot = pl_CAF_sub_cluster_prop,
+  filename = paste0(figure_dir, "/stack_barplot_CAFsubtype_cluster.pdf"),
+  width = unit(8, "in"), height = unit(8, "in")
+)
+```
+
+```{r}
+# reintegration of CAF scores and labels on complete xenium data set
+df_1 <- seurat@meta.data
+df_1$barcode <- rownames(df_1)
+df_2 <- ser_caf@meta.data[
+  , c("apCAF_module_score1", "iCAF_module_score1", "myCAF_module_score1", "CAF_subtype_ident")
+]
+df_2$barcode <- rownames(df_2)
+df_full <- dplyr::full_join(x = df_1, y = df_2, by = "barcode")
+
+seurat$apCAF_module_score1 <- df_full$apCAF_module_score1
+seurat$iCAF_module_score1 <- df_full$iCAF_module_score1
+seurat$myCAF_module_score1 <- df_full$myCAF_module_score1
+seurat$CAF_subtype_ident <- df_full$CAF_subtype_ident
+```
+
+```{r proportions of CAF subtypes}
+# proportions of CAF subtypes among all cells
+seurat$CAF_cell_type <- as.character(seurat$CAF_subtype_ident)
+seurat$CAF_cell_type[is.na(seurat$CAF_cell_type)] <- "non-CAF"
+seurat$CAF_cell_type <- factor(
+  seurat$CAF_cell_type,
+  levels <- c("non-CAF", levels(seurat$CAF_subtype_ident))
+)
+CAF_cell_type_pal <- c("non-CAF"="#999999", caf_pallete)
+
+# counts of cells belonging to each CAF subtype
+table(seurat$CAF_cell_type)
+table(seurat$CAF_cell_type, seurat$segment)
+
+CAFsubtype_prop_segment <- stack_cell_porportions(
+  seurat, group.by.x = "segment", group.by.stack = "CAF_cell_type"
+)
+CAFsubtype_prop_segment$CAF_cell_type <- factor(
+  CAFsubtype_prop_segment$CAF_cell_type, levels = levels(seurat$CAF_cell_type)
+)
+pl_CAF_all_segment_prop <- plot_stack(
+  CAFsubtype_prop_segment, group.by.x = "segment", group.by.stack = "CAF_cell_type",
+  fill.palette = CAF_cell_type_pal, label.percentage = TRUE
+)
+ggsave(
+  plot = pl_CAF_all_segment_prop,
+  filename = paste0(figure_dir, "/stack_barplot_CAFsubtype_segment_allcells.pdf"),
+  width = unit(6, "in"), height = unit(8, "in")
+)
+ggsave(
+  plot = pl_CAF_all_segment_prop + theme(legend.position = "none"),
+  filename = paste0(figure_dir, "/stack_barplot_CAFsubtype_segment_allcells_noLegend.pdf"),
+  width = unit(6, "in"), height = unit(8, "in")
+)
+
+CAFsubtype_prop_cluster <- stack_cell_porportions(
+  seurat, group.by.x = "seurat_clusters", group.by.stack = "CAF_cell_type"
+)
+CAFsubtype_prop_cluster$CAF_cell_type <- factor(
+  CAFsubtype_prop_cluster$CAF_cell_type, levels = levels(seurat$CAF_cell_type)
+)
+pl_CAF_sub_cluster_prop <- plot_stack(
+  CAFsubtype_prop_cluster, group.by.x = "seurat_clusters", group.by.stack = "CAF_cell_type",
+  fill.palette = caf_pallete, label.percentage = FALSE
+)
+ggsave(
+  plot = pl_CAF_sub_cluster_prop,
+  filename = paste0(figure_dir, "/stack_barplot_CAFsubtype_cluster_allCells.pdf"),
+  width = unit(8, "in"), height = unit(8, "in")
+)
+ggsave(
+  plot = pl_CAF_sub_cluster_prop + theme(legend.position = "none"),
+  filename = paste0(figure_dir, "/stack_barplot_CAFsubtype_cluster_allCells_noLegend.pdf"),
+  width = unit(8, "in"), height = unit(8, "in")
+)
+# CAF subtypes on original embedding
+umap_CAF_cell_type <- DimPlot(seurat, group.by = "CAF_cell_type") +
+  scale_color_manual(values = CAF_cell_type_pal)
+ggsave(
+  plot = umap_CAF_cell_type,
+  filename = paste0(figure_dir, "/umap_CAF_cell_type.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+ggsave(
+  plot = umap_CAF_cell_type + theme(legend.position = "none"),
+  filename = paste0(figure_dir, "/umap_CAF_cell_type_noLegend.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+```
+
+```{r labels highlighting interacting cells}
+fov_names <- c("fov", "fov.1", "fov.2", "fov.3", "fov.4")
+
+CAF_EPI_highlight <- sapply(
+  seq(nrow(seurat@meta.data)),
+  function(i) {
+    caf_ident <- seurat@meta.data[i, "CAF_subtype_ident"]
+    ifelse(
+      is.na(caf_ident),
+      return(seurat@meta.data[i, "epi_cells"]),
+      return(caf_ident)
+    )
+  }
+) |>
+  factor(
+    levels = c("epithelial", "PanIN", "CAF", "iCAF", "myCAF", "apCAF")
+  )
+
+table(CAF_EPI_highlight, useNA = "ifany")
+seurat$CAF_EPI_highlight <- CAF_EPI_highlight
+
+caf_epi_palette <- c(
+  caf_pallete, "epithelial" = "#EBF4A5", "PanIN" = "#FF0000"
+)
+
+# umap plot highlighting CAFs and epithelial cells
+umap_epi_caf <- DimPlot(seurat, group.by = "CAF_EPI_highlight") +
+  scale_color_manual(values = caf_epi_palette)
+print(umap_epi_caf)
+
+ggsave(
+  plot = umap_epi_caf,
+  filename = paste0(figure_dir, "/umap_CAF_EPI_highlight.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+ggsave(
+  plot = umap_epi_caf + theme(legend.position = "none"),
+  filename = paste0(figure_dir, "/umap_CAF_EPI_highlight_noLegend.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+# stacked barplots including epithelial and CAF cells
+seurat$CAF_EPI_highlight <- as.character(seurat$CAF_EPI_highlight)
+seurat$CAF_EPI_highlight[is.na(seurat$CAF_EPI_highlight)] <- "other"
+
+CAF_EPI_prop_segment <- stack_cell_porportions(
+  seurat, group.by.x = "segment", group.by.stack = "CAF_EPI_highlight"
+)
+seurat$CAF_EPI_highlight <- factor(
+  seurat$CAF_EPI_highlight,
+  levels = c("epithelial", "PanIN", "CAF", "iCAF", "myCAF", "apCAF")
+)
+CAF_EPI_prop_segment$CAF_EPI_highlight <- factor(
+  CAF_EPI_prop_segment$CAF_EPI_highlight, 
+  levels = levels(seurat$CAF_EPI_highlight)
+)
+pl_CAF_EPI_segment_prop <- plot_stack(
+  CAF_EPI_prop_segment, group.by.x = "segment", group.by.stack = "CAF_EPI_highlight",
+  fill.palette = caf_epi_palette, label.percentage = TRUE
+)
+ggsave(
+  plot = pl_CAF_EPI_segment_prop,
+  filename = paste0(figure_dir, "/stack_barplot_CAF_EPI_segment_allCells.pdf"),
+  width = unit(5, "in"), height = unit(6, "in")
+)
+ggsave(
+  plot = pl_CAF_EPI_segment_prop + theme(legend.position = "none"),
+  filename = paste0(figure_dir, "/stack_barplot_CAF_EPI_segment_allCells_noLegend.pdf"),
+  width = unit(5, "in"), height = unit(6, "in")
+)
+
+# identify CD4 T cells based on CD45, CD4, and CD3 expression
+T_cell_markers <- c("CD3D", "CD3E", "CD3G", "PTPRC", "CD4")
+T_cell_feat_expr <- as.matrix(seurat@assays$SCT@counts[T_cell_markers,])
+T_cell_logic <- apply(
+  T_cell_feat_expr, 2,
+  function(x){
+    (x[["CD3D"]] >= 1 | x[["CD3D"]] >= 1 | x[["CD3D"]] >= 1) &
+      x[["PTPRC"]] >= 1
+  }
+)
+
+CD4T_logic <- apply(
+  T_cell_feat_expr, 2,
+  function(x){
+    (x[["CD3D"]] >= 1 | x[["CD3D"]] >= 1 | x[["CD3D"]] >= 1) &
+      x[["PTPRC"]] >= 1 & 
+      x[["CD4"]] >= 1
+  }
+)
+
+T_cell_ident <- ifelse(T_cell_logic, "T_cell", NA)
+CD4T_ident <- ifelse(CD4T_logic, "CD4_T_cell", NA)
+
+seurat$T_cell_ident <- T_cell_ident[rownames(seurat@meta.data)]
+seurat$CD4_T_ident <- CD4T_ident[rownames(seurat@meta.data)]
+
+# apCAF identity alone
+apCAF_logic <- seurat$CAF_cell_type == "apCAF"
+names(apCAF_logic) <- rownames(seurat@meta.data)
+apCAF_ident <- ifelse(apCAF_logic, "apCAF", NA)
+
+seurat$apCAF_ident <- apCAF_ident[rownames(seurat@meta.data)]
+
+apCAF_CD4_df <- seurat@meta.data[, c("CD4_T_ident", "CAF_EPI_highlight")]
+
+apCAF_CD4_highlight <- sapply(
+  seq(nrow(apCAF_CD4_df)),
+  function(i) {
+    r <- apCAF_CD4_df[i,]
+    CD4T <- r[["CD4_T_ident"]]
+    epiCAF <- r[["CAF_EPI_highlight"]]
+    # if the cell has been typed as a CAF or epithelial cell, it is not considered
+    # for T cell identity
+    if(!is.na(epiCAF)) {
+      if(epiCAF == "apCAF") {
+        return("apCAF")
+      } else {
+        return(NA)
+      }
+    } else if(!is.na(CD4T)) {
+      return("CD4_T_cell")
+    } else {
+      return(NA)
+    }
+  }
+)
+table(apCAF_CD4_highlight, useNA = "ifany")
+
+seurat$apCAF_CD4_highlight <- apCAF_CD4_highlight
+
+apCAF_CD4_highlight_pal <- c(
+  "apCAF" = caf_epi_palette[["apCAF"]],
+  "CD4_T_cell" = "#B14380"
+)
+```
+
+```{r whole segment plots}
+for(i in seq_along(fov_names)){
+  f <- fov_names[i]
+  x_bounds <- c(0, max(seurat[[f]]@boundaries$centroids@coords[,1]))
+  y_bounds <- c(0, max(seurat[[f]]@boundaries$centroids@coords[,2]))
+  
+  p <- ImageDimPlot(
+    seurat, fov = f, group.by = "CAF_EPI_highlight", axes = T,
+    border.size = 0
+  ) +
+    scale_x_continuous(breaks = seq(x_bounds[1], x_bounds[2], by = 200)) +
+    scale_y_continuous(breaks = seq(y_bounds[1], y_bounds[2], by = 200)) + 
+    scale_fill_manual(values = caf_epi_palette, na.value = "#333333") +
+    theme(axis.text.x = element_text(angle = 30, vjust = 1, hjust=1))
+  ggsave(plot = p,
+         file = paste0(figure_dir, "/fullSegment_", f, "_", "CAF_EPI_highlight", ".pdf"),
+         height = unit(12, "in"), width = unit(12, "in"))
+  
+  p2 <- ggplot(p$plot_env$data, aes(x = y, y = x, color = CAF_EPI_highlight)) +
+    geom_point(
+      data = p$plot_env$data[is.na(p$plot_env$data[["CAF_EPI_highlight"]]),], 
+      size = 0.1) +
+    geom_point(
+      data = p$plot_env$data[!is.na(p$plot_env$data[["CAF_EPI_highlight"]]),], 
+      size = 0.1) +
+    scale_color_manual(values = caf_epi_palette, na.value = "#999999") +
+    theme_minimal() +
+    theme(panel.background = element_rect(fill = "#000000", color = "#FFFFFF"),
+          legend.key = element_rect(fill = "black"))
+  ggsave(plot = p2,
+         file = paste0(figure_dir, "/fullSegment_ggplot_", f, "_", "CAF_EPI_highlight", ".pdf"),
+         height = unit(12, "in"), width = unit(12, "in"))
+  ggsave(plot = p2 + theme(legend.position = "none"),
+         file = paste0(figure_dir, "/fullSegment_ggplot_", f, "_", "CAF_EPI_highlight", "_noLegend", ".pdf"),
+         height = unit(12, "in"), width = unit(12, "in"))
+  
+  p_cl <- ImageDimPlot(seurat, fov = f, group.by = "seurat_clusters")
+  p3 <- ggplot(p_cl$plot_env$data, aes(x = y, y = x, color = seurat_clusters)) +
+    geom_point(size = 0.1) +
+    theme_minimal() +
+    theme(panel.background = element_rect(fill = "#000000", color = "#FFFFFF"),
+          legend.key = element_rect(fill = "black"))
+  ggsave(plot = p3,
+         file = paste0(figure_dir, "/fullSegment_ggplot_", f, "_", "seurat_clusters", ".pdf"),
+         height = unit(12, "in"), width = unit(12, "in"))
+  ggsave(plot = p3 + theme(legend.position = "none"),
+         file = paste0(figure_dir, "/fullSegment_ggplot_", f, "_", "seurat_clusters", "_noLegend", ".pdf"),
+         height = unit(12, "in"), width = unit(12, "in"))
+}
+```
+
+```{r plots focused on PanIN regions}
+# image plots of CAF module scores and identity labels
+views <- c("panin01","panin02","panin03","panin04","panin05",
+           "panin06","panin07","panin08","panin09","panin10")
+
+for(i in seq_along(views)){
+  v <- views[i]
+  
+  pl_CAF_score <- ImageFeaturePlot(
+    seurat, fov = v, features = "panCAF_module_score1",
+    axes = TRUE, border.color = "#000000", border.size = 0.1
+  ) +
+    scale_fill_viridis_c(
+      option = "viridis",
+      values = c(
+        min(seurat$panCAF_module_score1, na.rm = TRUE), 
+        max(seurat$panCAF_module_score1, na.rm = TRUE)
+      ),
+      na.value = "#333333"
+    )
+  ggsave(
+    plot = pl_CAF_score,
+    filename = paste0(spatial_dir, "/ImageScore_", v, "_", "panCAF_module_score1", ".pdf"),
+    width = unit(12, "in"), height = unit(6, "in")
+  )
+  ggsave(
+    plot = pl_CAF_score + theme(legend.position = "none"),
+    filename = paste0(spatial_dir, "/ImageScore_", v, "_", "panCAF_module_score1", "_noLegend", ".pdf"),
+    width = unit(12, "in"), height = unit(6, "in")
+  )
+  
+  pl_apCAF_score <- ImageFeaturePlot(
+    seurat, fov = v, features = "apCAF_module_score1",
+    axes = TRUE, border.color = "#000000", border.size = 0.1
+  ) +
+    scale_fill_viridis_c(
+      option = "magma",
+      values = c(
+        min(seurat$apCAF_module_score1, na.rm = TRUE), 
+        max(seurat$apCAF_module_score1, na.rm = TRUE)
+      ),
+      na.value = "#333333"
+    )
+  ggsave(
+    plot = pl_apCAF_score,
+    filename = paste0(spatial_dir, "/ImageScore_", v, "_", "apCAF_module_score1", ".pdf"),
+    width = unit(12, "in"), height = unit(6, "in")
+  )
+  ggsave(
+    plot = pl_apCAF_score + theme(legend.position = "none"),
+    filename = paste0(spatial_dir, "/ImageScore_", v, "_", "apCAF_module_score1", "_noLegend", ".pdf"),
+    width = unit(12, "in"), height = unit(6, "in")
+  )
+  
+  pl_CAF_ident <- ImageDimPlot(
+    seurat, fov = v, group.by = "CAF_subtype_ident",
+    axes = TRUE, border.color = "#000000", border.size = 0.1
+  ) + scale_fill_manual(
+    values = caf_pallete,
+    na.value = "#333333"
+  )
+  ggsave(
+    plot = pl_CAF_ident,
+    filename = paste0(spatial_dir, "/ImageIdent_", v, "_", "CAF_subtype_Ident", ".pdf"),
+    width = unit(12, "in"), height = unit(6, "in")
+  )
+  ggsave(
+    plot = pl_CAF_ident + theme(legend.position = "none"),
+    filename = paste0(spatial_dir, "/ImageIdent_", v, "_", "CAF_subtype_Ident", "_noLegend", ".pdf"),
+    width = unit(12, "in"), height = unit(6, "in")
+  )
+  # expression of apCAF markers
+  pl_LUM <- ImageFeaturePlot(
+    seurat, fov = v, features = "LUM",
+    axes = TRUE, border.color = "#000000", border.size = 0.1
+  ) +
+    scale_fill_viridis_c(na.value = "#333333")
+  ggsave(
+    plot = pl_LUM,
+    filename = paste0(spatial_dir, "/ImageExpr_", v, "_", "LUM", ".pdf"),
+    width = unit(12, "in"), height = unit(6, "in")
+  )
+  ggsave(
+    plot = pl_LUM + theme(legend.position = "none"),
+    filename = paste0(spatial_dir, "/ImageExpr_", v, "_", "LUM", "_noLegend", ".pdf"),
+    width = unit(12, "in"), height = unit(6, "in")
+  )
+  
+  pl_HLADRA <- ImageFeaturePlot(
+    seurat, fov = v, features = "HLA-DRA",
+    axes = TRUE, border.color = "#000000", border.size = 0.1
+  ) +
+    scale_fill_viridis_c(na.value = "#333333")
+  ggsave(
+    plot = pl_HLADRA,
+    filename = paste0(spatial_dir, "/ImageExpr_", v, "_", "HLA-DRA", ".pdf"),
+    width = unit(12, "in"), height = unit(6, "in")
+  )
+  ggsave(
+    plot = pl_HLADRA + theme(legend.position = "none"),
+    filename = paste0(spatial_dir, "/ImageExpr_", v, "_", "HLA-DRA", "_noLegend", ".pdf"),
+    width = unit(12, "in"), height = unit(6, "in")
+  )
+  
+  
+  # seurat clusters
+  pl_clusters <- ImageDimPlot(
+    seurat, fov = v, group.by = "seurat_clusters",
+    axes = TRUE, border.color = "#000000", border.size = 0.1
+  )
+  ggsave(
+    plot = pl_clusters,
+    filename = paste0(spatial_dir, "/ImageIdent_", v, "_", "clusters", ".pdf"),
+    width = unit(12, "in"), height = unit(6, "in")
+  )
+  ggsave(
+    plot = pl_clusters + theme(legend.position = "none"),
+    filename = paste0(spatial_dir, "/ImageIdent_", v, "_", "clusters", "_noLegend", ".pdf"),
+    width = unit(12, "in"), height = unit(6, "in")
+  )
+  
+  # Highlight of both epithelial cells and CAFs
+  pl_CAF_EPI <- ImageDimPlot(
+    seurat, fov = v, group.by = "CAF_EPI_highlight",
+    axes = TRUE, border.color = "#000000", border.size = 0.1
+  ) + scale_fill_manual(
+    values = caf_epi_palette,
+    na.value = "#333333"
+  )
+  ggsave(
+    plot = pl_CAF_EPI,
+    filename = paste0(spatial_dir, "/ImageIdent_", v, "_", "CAF_EPI_highlight", ".pdf"),
+    width = unit(12, "in"), height = unit(6, "in")
+  )
+  ggsave(
+    plot = pl_CAF_EPI + theme(legend.position = "none"),
+    filename = paste0(spatial_dir, "/ImageIdent_", v, "_", "CAF_EPI_highlight", "_noLegend", ".pdf"),
+    width = unit(12, "in"), height = unit(6, "in")
+  )
+  
+  # Projected pattern weights of patterns 2 and 7
+  pl_p2 <- ImageFeaturePlot(
+    seurat, fov = v, features = "Pattern_2",
+    axes = TRUE, border.color = "#000000", border.size = 0.1
+  ) +
+    scale_fill_gradient(
+      limits = c(
+        min(seurat$Pattern_2, na.rm = TRUE), 
+        max(seurat$Pattern_2, na.rm = TRUE)
+      ),
+      low = "#FFFFFF", high = "#FF0000", na.value = "#333333"
+    )
+  ggsave(
+    plot = pl_p2,
+    filename = paste0(spatial_dir, "/ImageScore_", v, "_", "Pattern_2", ".pdf"),
+    width = unit(12, "in"), height = unit(6, "in")
+  )
+  ggsave(
+    plot = pl_p2 + theme(legend.position = "none"),
+    filename = paste0(spatial_dir, "/ImageScore_", v, "_", "Pattern_2", "_noLegend", ".pdf"),
+    width = unit(12, "in"), height = unit(6, "in")
+  )
+  pl_p7 <- ImageFeaturePlot(
+    seurat, fov = v, features = "Pattern_7",
+    axes = TRUE, border.color = "#000000", border.size = 0.1
+  ) +
+    scale_fill_gradient(
+      limits = c(
+        min(seurat$Pattern_7, na.rm = TRUE), 
+        max(seurat$Pattern_7, na.rm = TRUE)
+      ),
+      low = "#FFFFFF", high = "#FF0000", na.value = "#333333"
+    )
+  ggsave(
+    plot = pl_p7,
+    filename = paste0(spatial_dir, "/ImageScore_", v, "_", "Pattern_7", ".pdf"),
+    width = unit(12, "in"), height = unit(6, "in")
+  )
+  ggsave(
+    plot = pl_p7 + theme(legend.position = "none"),
+    filename = paste0(spatial_dir, "/ImageScore_", v, "_", "Pattern_7", "_noLegend", ".pdf"),
+    width = unit(12, "in"), height = unit(6, "in")
+  )
+  
+  # plot of T cell localization to apCAFs
+  pl_CD4 <- ImageFeaturePlot(
+    seurat, fov = v, features = "CD4",
+    axes = TRUE, border.color = "#000000", border.size = 0.1
+  ) +
+    scale_fill_viridis_c(na.value = "#333333")
+  ggsave(
+    plot = pl_CD4,
+    filename = paste0(spatial_dir, "/ImageExpr_", v, "_", "CD4", ".pdf"),
+    width = unit(12, "in"), height = unit(6, "in")
+  )
+  ggsave(
+    plot = pl_CD4 + theme(legend.position = "none"),
+    filename = paste0(spatial_dir, "/ImageExpr_", v, "_", "CD4", "_noLegend", ".pdf"),
+    width = unit(12, "in"), height = unit(6, "in")
+  )
+  
+  pl_apCAF_CD4_highlight <- ImageDimPlot(
+    seurat, fov = v, group.by = "apCAF_CD4_highlight",
+    axes = TRUE, border.color = "#000000" , border.size = 0.1
+  ) + 
+  scale_fill_manual(values = apCAF_CD4_highlight_pal, na.value = "#333333")
+  ggsave(
+    plot = pl_apCAF_CD4_highlight,
+    filename = paste0(spatial_dir, "/ImageIdent_", v, "_", "apCAF_CD4T_highlight", ".pdf"),
+    width = unit(12, "in"), height = unit(6, "in")
+  )
+  ggsave(
+    plot = pl_apCAF_CD4_highlight + theme(legend.position = "none"),
+    filename = paste0(spatial_dir, "/ImageIdent_", v, "_", "apCAF_CD4T_highlight", "_noLegend", ".pdf"),
+    width = unit(12, "in"), height = unit(6, "in")
+  )
+}
+```
+
+```{r save results}
+# complete seurat object
+saveRDS(seurat, file = paste0(result_dir, "/Xenium_CAFtypeAnnotation.rds"))
+saveRDS(ser_caf, file = paste0(result_dir, "/Xenium_CAFsubset.rds"))
+
+# tables for stacked barplots
+write.csv(
+  CAF_EPI_prop_segment,
+  file = paste0(
+    result_dir, "/cellProportion_",
+    "allCells","_","CAF_EPI_highlight","_by_", "segment", ".csv")
+)
+write.csv(
+  CAF_prop,
+  file = paste0(
+    result_dir, "/cellProportion_",
+    "allCells","_","CAFidentity","_by_", "cluster", ".csv")
+)
+write.csv(
+  CAF_prop_segment,
+  file = paste0(
+    result_dir, "/cellProportion_",
+    "allCells","_","CAFidentity","_by_", "segment", ".csv")
+)
+write.csv(
+  CAFsubtype_prop_segment,
+  file = paste0(
+    result_dir, "/cellProportion_",
+    "allCells","_","CAFsubtype","_by_", "segment", ".csv")
+)
+write.csv(
+  CAFsubtype_prop_cluster,
+  file = paste0(
+    result_dir, "/cellProportion_",
+    "allCells","_","CAFsubtype","_by_", "cluster", ".csv")
+)
+write.csv(
+  CAF_sub_prop,
+  file = paste0(
+    result_dir, "/cellProportion_",
+    "CAFs","_","CAFsubtype","_by_", "segment", ".csv")
+)
+write.csv(
+  CAF_sub_cluster_prop,
+  file = paste0(
+    result_dir, "/cellProportion_",
+    "CAFs","_","CAFsubtype","_by_", "cluster", ".csv")
+)
+```
+
+```{r sessionInfo}
+sessionInfo()
+```
+
