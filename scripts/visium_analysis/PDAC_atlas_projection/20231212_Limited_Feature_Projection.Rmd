@@ -1,0 +1,243 @@
+---
+title: "20231212_Limited_Feature_Projection"
+author: "Jacob Mitchell"
+date: "2023-12-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(monocle3)
+library(Seurat)
+library(CoGAPS)
+library(projectR)
+library(ggplot2)
+library(ggpubr)
+
+set.seed(123)
+sessionInfo()
+```
+
+```{r}
+result_dir <- "results/20231212_Limited_Feature_Projection"
+if(!dir.exists(result_dir)) dir.create(result_dir)
+```
+
+```{r}
+# load Visium Data
+load("data/20220428_panin_epithelial/panin_epithelial.Rda")
+
+# load CoGAPS result
+cogaps <- readRDS("../PDAC_Atlas_Pipeline/CoGAPS_output/epiMat-e74511f6-8a1d-4929-ab42-1cb67c5a4fb6-result-8pattern.rds")
+
+# load monocle3 expression data
+cds <- readRDS("../PDAC_Atlas_Pipeline/CoGAPS/cds_combined_epithelial_Peng&Steele_8_SHARED_GENES_QC_filtered_harmonized_preprocessed_aligned_manuscript_UMAP_learn_graph(6).rds")
+
+patterns <- c(
+  "Pattern_1", "Pattern_2", "Pattern_3", "Pattern_4", "Pattern_5", "Pattern_6", "Pattern_7", "Pattern_8"
+)
+
+```
+
+```{r}
+# projection result to full feature set
+project_embed <- projectR(data = panin_epithelial@assays$SCT@scale.data, loadings = cogaps)
+
+pattern_weights <- as.data.frame(t(project_embed))
+for(pattern in colnames(pattern_weights)) {
+  panin_epithelial <- AddMetaData(object = panin_epithelial,
+                                  metadata = pattern_weights[[pattern]],
+                                  col.name = pattern)
+}
+
+# projection result to limited feature set
+xenium_features <- readRDS("data/xenium_data/xenium_panin_features.rds")
+xen_feature_expression <- panin_epithelial@assays$SCT@scale.data[
+  rownames(panin_epithelial@assays$SCT@scale.data) %in% xenium_features,
+]
+
+dim(xen_feature_expression)
+# 314 RNA features in common with the 380 features from the Xenium data set
+
+project_embed_xen <- projectR(
+  data = xen_feature_expression, 
+  loadings = cogaps
+)
+pattern_weights_xen <- as.data.frame(t(project_embed_xen))
+colnames(pattern_weights_xen) <- paste0(colnames(pattern_weights_xen), "_xenium")
+for(pattern in colnames(pattern_weights_xen)) {
+  panin_epithelial <- AddMetaData(object = panin_epithelial,
+                                  metadata = pattern_weights_xen[[pattern]],
+                                  col.name = pattern)
+}
+
+# Assess correlations between the projected weights with full and subset feature sets
+cor_ls <- list()
+for(p in patterns){
+  pat <- p
+  pat_xen <- paste0(p, "_xenium")
+  pearson_cor <- cor(
+    x = panin_epithelial@meta.data[[pat]],
+    y = panin_epithelial@meta.data[[pat_xen]],
+    method = "pearson"
+  )
+  spearman_cor <- cor(
+    x = panin_epithelial@meta.data[[pat]],
+    y = panin_epithelial@meta.data[[pat_xen]],
+    method = "spearman"
+  )
+  res <- c(
+    "pearson_cor" = pearson_cor,
+    "spearman_cor" = spearman_cor
+  )
+  cor_ls[[p]] <- res
+}
+cor_df <- data.frame(t(data.frame(cor_ls)))
+cor_df$pattern <- factor(rownames(cor_df))
+
+# plot correlation results
+pl_pattern_pearson <-
+  ggplot(cor_df, aes(x = pattern, y = pearson_cor)) +
+  geom_bar(stat = "identity") +
+  lims(y = c(0,1)) +
+  ylab("Pearson Correlation") +
+  theme_bw()
+pl_pattern_pearson
+ggsave(
+  plot = pl_pattern_pearson,
+  filename = paste0(result_dir, "/barplot_VisiumProjection_XeniumFeatures_pearsonCorrlation.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+
+pl_pattern_spearman <-
+  ggplot(cor_df, aes(x = pattern, y = spearman_cor)) +
+  geom_bar(stat = "identity") +
+  lims(y = c(0,1)) +
+  ylab("Spearman Correlation") +
+  theme_bw()
+pl_pattern_spearman
+ggsave(
+  plot = pl_pattern_spearman,
+  filename = paste0(result_dir, "/barplot_VisiumProjection_XeniumFeatures_spearmanCorrlation.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+for(p in patterns){
+  pdf(file = paste0(result_dir, "/pairs_VisiumProjection_XeniumFeatures_", p, ".pdf"), width = 6, height = 6)
+  pairs(
+    panin_epithelial@meta.data[
+      ,
+      grepl(paste0("^", p), colnames(panin_epithelial@meta.data))
+    ]
+  )
+  dev.off()
+  
+  pat_df <- data.frame(
+    "projected_weight_allFeatures" = panin_epithelial@meta.data[, p],
+    "projected_weight_XeniumFeatures" = panin_epithelial@meta.data[, paste0(p, "_xenium")]
+  )
+  pl <- ggplot(pat_df, aes(x = projected_weight_allFeatures, y = projected_weight_XeniumFeatures)) +
+    geom_point() +
+    stat_smooth(method = "lm", color = "#FF0000") +
+    ggtitle(p) +
+    stat_cor(method = "spearman") +
+    theme_bw()
+  print(pl)
+  ggsave(
+    plot = pl,
+    paste0(result_dir, "/cor_XeniumProjection_XeniumFeatures_", p, ".pdf"),
+    width = unit(6, "in"), height = unit(6, "in")
+  )
+}
+```
+
+```{r}
+# projection onto atlas expression of Xenium features
+atlas_counts <- counts(cds)
+rownames(atlas_counts) <- fData(cds)$gene_short_name
+atlas_counts_xen <- atlas_counts[rownames(atlas_counts) %in% xenium_features,]
+atlas_norm_xen <- as.matrix(log2(atlas_counts_xen + 1))
+
+# Of the 380 gene probes in the Xenium panel, 363 of the genes are also present in the PDAC atlas expression data
+dim(atlas_counts_xen)
+length(xenium_features)
+
+project_atlas_xen <- t(projectR(
+  data = atlas_norm_xen, 
+  loadings = cogaps
+))
+dim(project_atlas_xen)
+dim(cogaps@sampleFactors)
+
+atlas_cor_ls <- list()
+for(p in patterns){
+  pat <- p
+  pearson_cor <- cor(
+    x = project_atlas_xen[, p],
+    y = cogaps@sampleFactors[, p],
+    method = "pearson"
+  )
+  spearman_cor <- cor(
+    x = project_atlas_xen[, p],
+    y = cogaps@sampleFactors[, p],
+    method = "spearman"
+  )
+  res <- c(
+    "pearson_cor" = pearson_cor,
+    "spearman_cor" = spearman_cor
+  )
+  atlas_cor_ls[[p]] <- res
+}
+
+atlas_cor_df <- data.frame(t(data.frame(atlas_cor_ls)))
+atlas_cor_df$pattern <- factor(rownames(atlas_cor_df))
+
+pl_atlas_pearson <-
+  ggplot(atlas_cor_df, aes(x = pattern, y = pearson_cor)) +
+  geom_bar(stat = "identity") +
+  lims(y = c(0,1)) +
+  ylab("Pearson Correlation") +
+  theme_bw()
+pl_atlas_pearson
+ggsave(
+  plot = pl_atlas_pearson,
+  filename = paste0(result_dir, "/barplot_AtlasProjection_XeniumFeatures_pearsonCorrlation.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+
+pl_atlas_spearman <-
+  ggplot(atlas_cor_df, aes(x = pattern, y = spearman_cor)) +
+  geom_bar(stat = "identity") +
+  lims(y = c(0,1)) +
+  ylab("Spearman Correlation") +
+  theme_bw()
+pl_atlas_spearman
+ggsave(
+  plot = pl_atlas_spearman,
+  filename = paste0(result_dir, "/barplot_AtlasProjection_XeniumFeatures_spearmanCorrlation.pdf"),
+  width = unit(6, "in"), height = unit(6, "in")
+)
+for(p in patterns){
+  pat_df <- data.frame(
+    "pattern_weight" = cogaps@sampleFactors[, p],
+    "projected_weight" = project_atlas_xen[, p]
+  )
+  pl <- ggplot(pat_df, aes(x = pattern_weight, y = projected_weight)) +
+    geom_point() +
+    stat_smooth(method = "lm", color = "#FF0000") +
+    ggtitle(p) +
+    stat_cor(method = "spearman") +
+    theme_bw()
+  print(pl)
+  ggsave(
+    plot = pl,
+    paste0(result_dir, "/cor_AtlasProjection_XeniumFeatures_", p, ".pdf"),
+    width = unit(6, "in"), height = unit(6, "in")
+  )
+}
+
+```
+
+

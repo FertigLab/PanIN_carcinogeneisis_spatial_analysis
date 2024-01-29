@@ -1,0 +1,63 @@
+---
+title: "cluster_highlight_plots"
+author: "Jacob Mitchell"
+date: "2024-01-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(Seurat)
+library(ggplot2)
+library(ggpubr)
+library(gridExtra)
+library(RColorBrewer)
+
+set.seed(123)
+sessionInfo()
+```
+
+```{r}
+figure_dir <- "results/20240118_cluster_highlight_plots"
+if(!dir.exists(figure_dir)) dir.create(figure_dir)
+```
+
+```{r}
+seurat <- readRDS("data/merged_slides_SCT_HARMONY.rds")
+```
+
+```{r}
+image_names <- Images(seurat)
+clusters <- levels(seurat$cellclass)
+
+for(i in seq_along(image_names)){
+  img <- image_names[i]
+  pl_ls <- list()
+  
+  for(j in seq_along(clusters)){
+    cl <- as.character(clusters[j])
+    barcode_highlight <- rownames(seurat@meta.data[seurat$cellclass == cl,])
+    
+    p <- SpatialDimPlot(
+      seurat, images = img, pt.size.factor = 2, 
+      cells.highlight = barcode_highlight, 
+      cols.highlight = c("Group_1" = "#FF0000", "Unselected" = "#CCCCCC")
+    ) +
+      theme(legend.position = "none") +
+      ggtitle(cl)
+    
+    pl_ls[[cl]] <- p
+  }
+  pl_arrange <- grid.arrange(grobs = pl_ls, ncol = 5)
+  ggsave(
+    plot = as_ggplot(pl_arrange),
+    file = paste0(figure_dir, "/", img, "_Louvain_cluster_highlight", ".pdf"),
+    width = unit(12, "in"), height = unit(9, "in")
+  )
+}
+
+```
+

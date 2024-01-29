@@ -1,0 +1,428 @@
+---
+title: "20220516_AtlasToSpatial_TransferLearning"
+author: "Jacob Mitchell"
+date: "5/16/2022"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# knitr::opts_knit$set(root.dir = normalizePath(".."))
+```
+
+```{r}
+library(ggplot2)
+library(ggpubr)
+library(CoGAPS)
+library(plyr)
+library(dplyr)
+library(forcats)
+library(monocle3)
+library(Seurat)
+library(projectR)
+library(fgsea)
+library(msigdbr)
+library(dittoSeq)
+
+# Increase memory limit for R on Windows
+if (memory.limit() < 15000){
+  memory.limit(size = 15000)
+}
+
+sessionInfo()
+```
+
+```{r}
+# load in Luciane's Panin visium data
+load("data/20220428_panin_epithelial/panin_epithelial.Rda")
+
+# read in the CoGAPS results object and cds object subset to epithelial cells
+cogaps <- readRDS("../PDAC_Atlas_Pipeline/CoGAPS_output/epiMat-e74511f6-8a1d-4929-ab42-1cb67c5a4fb6-result-8pattern.rds")
+cds <- readRDS("../PDAC_Atlas_Pipeline/CoGAPS/cds_combined_epithelial_Peng&Steele_8_SHARED_GENES_QC_filtered_harmonized_preprocessed_aligned_manuscript_UMAP_learn_graph(6).rds")
+```
+
+### CoGAPS Pattern Marker Cells and Pattern Weight Assignments for PDAC Atlas
+
+```{r}
+# Assign cells as pattern markers based on the patternMarkers function
+## Run the pattern marker statistic on the cells 
+cellPatternMarker <- patternMarkers(cogaps, axis = 2)
+
+## Add the pattern to the cell marker result
+for(i in 1:length(cellPatternMarker$PatternMarkers)){
+  ## Concert to a df
+  cellPatternMarker$PatternMarkers[[i]] <- as.data.frame(cellPatternMarker$PatternMarkers[[i]])
+  ## create column name
+  colnames(cellPatternMarker$PatternMarkers[[i]]) <- "CellID"
+  cellPatternMarker$PatternMarkers[[i]]$Pattern <- names(cellPatternMarker$PatternMarkers[i])
+}
+
+## Combined the tables
+cellPatternMarkerDataFrame <- do.call("rbind", cellPatternMarker$PatternMarkers)
+## Update rownames
+rownames(cellPatternMarkerDataFrame) <- cellPatternMarkerDataFrame$CellID
+
+## Add the pattern assignment to the cds
+colData(cds)$AssignedPattern <- cellPatternMarkerDataFrame[colnames(cds), "Pattern"]
+```
+
+```{r}
+# Incorporate pattern weights learned from CoGAPS in the cds metadata
+# Extract the pattern matrix
+patMat <- cogaps@sampleFactors
+# Merge with the column data in the cds
+cds@colData <- cbind(colData(cds), patMat[colnames(cds), ])
+# data frame of the gene names and ensembl IDs of the cell features
+cds_gene_names <- as.data.frame(cds@rowRanges@elementMetadata@listData[c("gene_ensembl_ID", "gene_short_name")])
+```
+
+```{r}
+# create an additional classifier for cells that divides Epithelial_normal
+# into normal cells from non-PDAC patients and normal_tumor_adjacent cells
+# from patients with PDAC
+
+cds@colData$Epithelial_Cell_Type <- paste0(as.character(cds@colData$TN),"_", 
+                                    as.character(cds@colData$TN_assigned_cell_type_immune_broad))
+cds@colData$Epithelial_Cell_Type <- gsub("T_Epithelial_cancer", "Cancer",
+                                    gsub("T_Epithelial_unspecified", "Unspecified",
+                                    gsub("T_Epithelial_normal", "Normal_Tumor_Adjacent",
+                                    gsub("N_Epithelial_cancer", "Cancer",
+                                    gsub("N_Epithelial_unspecified", "Unspecified",
+                                    gsub("N_Epithelial_normal", "Normal", cds@colData$Epithelial_Cell_Type))))))
+```
+
+### Projection of PDAC Atlas Patterns to PanIN Visium Data
+
+```{r}
+# project CoGAPS pattern weights from PDAC atlas epithelial cells onto
+# SCT scaled transcript matrix of panin visium epithelial cells
+project_embed <- projectR(data = panin_epithelial@assays$SCT@scale.data, loadings = cogaps)
+
+# add projected patterns to seurat object
+pattern_weights <- as.data.frame(t(project_embed))
+
+for(pattern in colnames(pattern_weights)) {
+  panin_epithelial <- AddMetaData(object = panin_epithelial,
+                                  metadata = pattern_weights[[pattern]],
+                                  col.name = pattern)
+}
+
+```
+
+### Creation of Results Directories
+
+```{r}
+# order tumor grade annotation from normal to low to high
+panin_epithelial$Grade <- factor(panin_epithelial$Grade,
+                                 levels = c("N", "LG", "HG"))
+# Palette for grade colors
+# yellow, orange, red
+Grade_pal <- c("#EBF4A5", "#F2A93B", "#EA3F25")
+# list of CoGAPS Patterns
+patterns <- colnames(pattern_weights)
+# list of Panin Images
+panin_images <- Images(panin_epithelial)
+
+# filepath to save results and figures
+figurepath <- "results/20220516_figures"
+if (!dir.exists(figurepath)){
+  dir.create(figurepath, recursive = TRUE)
+}
+# Directory of Violin Plots
+Vlnpath <- paste0(figurepath, "/Projected_Pattern_ViolinPlots")
+if (!dir.exists(Vlnpath)){
+  dir.create(Vlnpath, recursive = TRUE)
+}
+# Directory of Pattern Weights on Slides
+PatternSpatialpath <- paste0(figurepath, "/Projected_Pattern_SpatialPlots")
+if (!dir.exists(PatternSpatialpath)){
+  dir.create(PatternSpatialpath, recursive = TRUE)
+}
+# Directory of Epithelial Grade on Slides
+GradeSpatialpath <- paste0(figurepath, "/Grade_SpatialPlots")
+if (!dir.exists(GradeSpatialpath)){
+  dir.create(GradeSpatialpath, recursive = TRUE)
+}
+# Directory of Pattern Weights in the PDAC Atlas
+PatternAtlaspath <- paste0(figurepath, "/Pattern_AtlasPlots")
+if (!dir.exists(PatternAtlaspath)){
+  dir.create(PatternAtlaspath, recursive = TRUE)
+}
+# TFF1 Expression Plots
+TFF1path <- paste0(figurepath, "/TFF1_Expression")
+if (!dir.exists(TFF1path)){
+  dir.create(TFF1path, recursive = TRUE)
+}
+# Cell Types from PDAC Atlas
+CellTypepath <- paste0(figurepath, "/Atlas_Cell_Types")
+if (!dir.exists(CellTypepath)){
+  dir.create(CellTypepath, recursive = TRUE)
+}
+
+
+# Save RDS of the visium data with projected pattern weights
+saveRDS(panin_epithelial,
+        file = paste0(figurepath, "/panin_epithelial_projected_cogaps_patterns.rds"))
+```
+
+### Custom Plotting Functions
+
+```{r}
+# functions for consistent plotting parameters
+
+# Pattern Weight UMAP Plots for the PDAC Atlas
+plotUMAP <- function(cds, color_cells_by, title, show = TRUE) {
+  plot <- plot_cells(cds, color_cells_by = color_cells_by,
+                     label_cell_groups = FALSE, show_trajectory_graph = FALSE) +
+    theme(legend.position = "bottom") +
+    ggtitle(title)
+  if(show){
+    print(plot)
+  }
+  return(plot)
+}
+
+# Violin Plots: Projected Pattern Weight in Each Tumor Grade
+plotViolin <- function(seurat, feature, title, show = TRUE){
+  violin <- VlnPlot(seurat, features = feature, group.by = "Grade",
+                  cols = Grade_pal)
+  # save minimum and maximum y axis limits for feature to ensure that space is left
+  # for the ggpubr significance marks
+  
+  feat_range <- layer_scales(violin)$y$get_limits()
+  feat_dif <- feat_range[2] - feat_range[1]
+  y_min <- feat_range[1]
+  y_max <- feat_range[2] + feat_dif/2.5
+  
+  plot <- violin +
+    ylim(c(y_min, y_max)) +
+    stat_compare_means(comparisons = list(
+      c("N", "LG"),
+      c("N", "HG"),
+      c("LG", "HG"))) +
+    ggtitle(title) + 
+    ylab(paste0("projected ", feature, " weight")) +
+    xlab("epithelial lesion grade")
+  if(show){
+    print(plot)
+  }
+  return(plot)
+}
+
+# Spatial Plots: Projected Pattern Weight in Spots on Slides
+plotPatternSpatial <- function(seurat, feature, image, show = TRUE){
+  plot <- SpatialFeaturePlot(seurat, features = feature, images = image,
+                             pt.size.factor = 3)
+  if(show){
+    print(plot)
+  }
+  return(plot)
+}
+
+# Spatial Plots: Tumor Grade in Spots on Slides
+plotGradeSpatial <- function(seurat, group, image, show = TRUE){
+  plot <- SpatialDimPlot(seurat, group.by = group, images = image,
+                         pt.size.factor = 3, cols = Grade_pal)
+  if(show){
+    print(plot)
+  }
+  return(plot)
+}
+```
+
+### Plot Projected Pattern Weights
+
+```{r}
+for(p in patterns){
+  vln_plot <- plotViolin(panin_epithelial, feature = p, title = NULL)
+  ggsave(filename = paste0(Vlnpath, "/", p, "_Projected_Weights.pdf"),
+         plot = vln_plot,
+         width = unit(6, "in"),
+         height = unit(6, "in"))
+}
+```
+
+### Plot Projected Pattern Weights and Epithelial Cell Grades on image data
+
+```{r}
+for(i in panin_images){
+  i_name <- gsub("\\.", "_", i)
+  
+  grade_plot <- plotGradeSpatial(panin_epithelial, group = "Grade", image = i) 
+  ggsave(filename = paste0(GradeSpatialpath, "/", i_name, "_Epithelial_Grade.pdf"),
+         plot = grade_plot,
+         width = unit(10, "in"),
+         height = unit(10, "in"))
+  
+  # nested loop for plotting each pattern's weight on each image
+  for(p in patterns){
+    pat_plot <- plotPatternSpatial(panin_epithelial, feature = p, image = i) +
+      scale_fill_viridis_c(option = "magma") +
+      theme(legend.position="right")
+    
+    ggsave(filename = paste0(PatternSpatialpath, "/", p, "_", i_name, "_Epithelial_Projection.pdf"),
+           plot = pat_plot,
+           width = unit(10, "in"),
+           height = unit(10, "in"))
+  }
+}
+```
+
+### Plot UMAPs of Pattern Weights in PDAC Atlas
+
+```{r}
+for(p in patterns){
+  umap_plot <- plotUMAP(cds = cds, color_cells_by = p, title = NULL) +
+    scale_color_viridis_c(option = "magma") +
+    labs(color=p)
+  ggsave(filename = paste0(PatternAtlaspath, "/", p, "_Atlas_Weights.pdf"),
+         plot = umap_plot,
+         width = unit(10, "in"),
+         height = unit(10, "in"))
+}
+```
+
+### UMAP Plot of TFF1 Expression in Atlas
+
+```{r}
+TFF1_plot <- plot_cells(cds, genes = "TFF1",
+             label_cell_groups = FALSE, show_trajectory_graph = FALSE) +
+  theme(legend.position = "bottom") +
+  scale_color_viridis_c()
+print(TFF1_plot)
+ggsave(filename = paste0(TFF1path, "/TFF1_Atlas_Expression.pdf"),
+       plot = TFF1_plot,
+       width = unit(10, "in"),
+       height = unit(10, "in"))
+
+# TFF1 Expression in Panin Visium
+for(i in panin_images){
+  i_name <- gsub("\\.", "_", i)
+  TFF1_spatial_plot <- plotPatternSpatial(panin_epithelial, feature = "TFF1", image = i) +
+    scale_fill_viridis_c() +
+    theme(legend.position="right")
+  print(TFF1_spatial_plot)
+  ggsave(filename = paste0(TFF1path, "/TFF1_", i_name, "_Spatial_Expression.pdf"),
+           plot = TFF1_spatial_plot,
+           width = unit(10, "in"),
+           height = unit(10, "in"))
+}
+
+# Violin Plot of TFF1 Expression in Panin Visium
+TFF1_vln_plot <- plotViolin(panin_epithelial, feature = "TFF1", title = NULL) +
+  ylab("TFF1 Expression")
+ggsave(filename = paste0(TFF1path, "/TFF1_PanIN_Expression.pdf"),
+       plot = TFF1_vln_plot,
+       width = unit(6, "in"),
+       height = unit(6, "in"))
+```
+
+### UMAP of Epithelial Cell Types in the PDAC Atlas
+
+```{r}
+epi_plot <- plotUMAP(cds, color_cells_by = "Epithelial_Cell_Type", title = NULL) +
+  scale_color_manual(values = dittoColors()[c(3,2,5,7)])
+print(epi_plot)
+ggsave(filename = paste0(CellTypepath, "/Epithelial_Atlas_Cell_Types.pdf"),
+       plot = epi_plot,
+       width = unit(10, "in"),
+       height = unit(10, "in"))
+```
+
+### UMAP of Epithelial Cell Types in ST Panin Data
+
+```{r}
+# get metadata
+md <- panin_epithelial[[]]
+# get embeddings
+coords <- Embeddings(panin_epithelial[["umap"]])
+# combine dataframes
+md <- cbind(md, coords)
+
+# plot
+st_umap <- ggplot(md, aes(x = UMAP_1, y = UMAP_2, fill = Grade)) +
+  scale_fill_manual(values = Grade_pal) +
+  geom_point(shape = 21, size = 4, stroke = 0.1) + theme_classic()
+print(st_umap)
+ggsave(filename = paste0(CellTypepath, "/Epithelial_Spatial_Cell_Types.pdf"),
+       plot = st_umap,
+       width = unit(10, "in"),
+       height = unit(10, "in"))
+```
+
+### Pattern Marker Overrepresentation and Plotting
+
+```{r}
+patternMarkerResults <- patternMarkers(cogaps, threshold = "cut", lp = NA, axis = 1)
+names(patternMarkerResults$PatternMarkers) <- colnames(patternMarkerResults$PatternMarkerRanks)PMlist <- patternMarkerResults$PatternMarkers
+
+patternmarks <- data.frame(lapply(patternMarkerResults$PatternMarkers, "length<-",
+                                  max(lengths(patternMarkerResults$PatternMarkers))))
+
+hallmark_df <- msigdbr(species = "Homo sapiens", category = "H")
+hallmark_list <- hallmark_df %>% split(x = .$gene_symbol, f = .$gs_name)
+for (pattern in names(PMlist)) {
+  
+  # Over-representation analysis of pattern markers ###########################
+  suppressWarnings(
+    result <- fora(pathways = hallmark_list,
+                   genes = PMlist[[pattern]],
+                   universe = Hs_genes$hgnc_symbol,
+                   maxSize=2038)
+  )
+  
+  # Append ratio of overlap/# of genes in hallmark (k/K)
+  result$"k/K" <- result$overlap/result$size
+  
+  # Append log-transformed HB-adjusted q value (-10 * log(adjusted p value))
+  result$"neg.log.q" <- (-10) * log10(result$padj)
+  
+  # Append shortened version of hallmark's name without "HALLMARK_"
+  result$MsigDB_Hallmark <- substr(result$pathway, 10, nchar(result$pathway))
+  
+  # Reorder dataframe by ascending adjusted p value
+  result <- mutate(result, MsigDB_Hallmark=fct_reorder(MsigDB_Hallmark, - padj))
+  
+  # rearrange columns to move overlap genes to the end and convert to vector for
+  # compatibility with saving as csv
+  result <- relocate(result, "overlapGenes", .after = "MsigDB_Hallmark")
+  result <- relocate(result, "neg.log.q", .after = "padj")
+  result <- result %>% mutate(overlapGenes = sapply(overlapGenes, toString))
+  
+  # save pattern marker overlaps as a csv file
+  write.csv(result,
+            file = paste0("results/MsigDB_ORA/", pattern, "_MsigDB_OverRepresentationAnalysis.csv"))
+  
+  # for plotting, limit the results to significant over-representation
+  result <- result[result$padj < 0.05,]
+  
+  #plot and save the waterfall plot of ORA p-values
+  plot <- ggplot(result, aes_string(y = "neg.log.q", x = "MsigDB_Hallmark", fill = "MsigDB_Hallmark")) +
+    ## Specifies barplot
+    geom_col() +
+    ## Rename y axis
+    ylab("-10*log10(FDR q-value)") + 
+    ## Flips the coordinates
+    coord_flip() +
+    ## Makes the background white
+    theme_minimal() +
+    ## Add title
+    ggtitle(paste0(pattern, ": Overrepresented MsigDB Hallmarks")) +
+    ## This creates the dotted line at .05 value 
+    geom_hline(yintercept=c(13.0103), linetype="dotted") + # Add veritcle line to show significances
+    ## Adds the q values
+    geom_text(aes(label=format(signif(padj, 4))), hjust = -.04) +
+    ## Removes legend
+    theme(legend.position = "none") +
+    ## specifies limits 
+    ylim(0, ceiling(max(result$"neg.log.q")) + (max(result$"neg.log.q")/4))
+  ggsave(paste0("results/figures/Pattern_MsigDB_ORA/", pattern, "_ORA.pdf"),
+         plot = plot,
+         width = unit(10, "in"),
+         height = unit(6, "in"),
+         device = "pdf")
+}
+```
+
