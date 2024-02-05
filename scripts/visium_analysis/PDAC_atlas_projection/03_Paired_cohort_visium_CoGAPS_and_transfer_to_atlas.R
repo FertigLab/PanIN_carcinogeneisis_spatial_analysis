@@ -250,6 +250,7 @@ for(i in panin_images){
 # scatter plots of projected ST patterns onto atlas (Supplemental 18C) ####
 library(projectR)
 # reading in pre-processed PDAC atlas matrix prepared for CoGAPS
+# scRNA-Seq PDAC atlas matrix, geneNames and sampleNames can be generated following the scripts available at https://github.com/FertigLab/PDAC_Atlas/tree/main/Atlas/EP_COGAPS
 epimat <- Matrix::readMM('../epiMat.mtx')
 
 # gene and sample names for the matrix
