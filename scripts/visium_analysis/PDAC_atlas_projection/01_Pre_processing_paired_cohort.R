@@ -262,6 +262,13 @@ data_merged$trueidents[rownames(data_merged@meta.data) %in% truecells] <- "truen
 
 # PREPROCESSING 6 - ANNOTATING HIGH AND LOW GRADE NEOPLASIA ####
 # LG/HG annotation with SpatialDimChoose (import previously annotated data)
+# FUNCTION: SpatialDimChoose()
+# object is data
+# image is the slide (i.e. "slice1.1), 
+# group.by is the ident that is displayed on the dimplot
+# new_identity is the new identity that the subset will go into. can be an identity that already exists
+# group_name is the name of the subset for that round of clicking spots (i.e. low_grade
+
 # data_merged <- SpatialDimChoose(data_merged, group.by = "post_harmony_clusters", new_identity = "paningrade", group_name = "low_grade", image = "slice1")
 data_merged$paningrade <- readRDS("..objects_and_metadata/paningrade.rds")
 
